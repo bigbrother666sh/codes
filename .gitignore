@@ -11,3 +11,5 @@ docs/
 # Bridge
 bridge/node_modules/
 bridge/.env
+
+.DS_Store
