@@ -63,6 +63,32 @@ chmod +x deploy.sh
 3. **HTTP Token** — 自动生成，也可自定义
 4. **工作目录** — Claude Code 的项目存放路径
 
+备注：
+
+1、如果服务器网络环境极端（比如完全无法访问外网），可以在本机交叉编译后直接传二进制上去：
+
+```
+# 本机执行
+GOOS=linux GOARCH=amd64 go build -o codes-linux ./cmd/codes
+scp codes-linux user@server:/usr/local/bin/codes
+```
+
+这样服务器上完全不需要 Go 环境，Phase 2 和 Phase 5 都可以跳过。
+
+2、 如果需要为 claude code 启用 mcp server，需要手动编辑 ~/.claude.json 增加 mcpServers 字段
+
+（可以从本机拷贝）
+
+3、如果使用三方中转的 claude api，还是需要单独为 claude code 配置下转发：
+
+for example:
+
+```
+echo 'export ANTHROPIC_BASE_URL="https://ai.ourines.com/api"' >> ~/.bashrc
+echo 'export ANTHROPIC_AUTH_TOKEN="你的API密钥"' >> ~/.bashrc
+source ~/.bashrc
+```
+
 ---
 
 ## 手动部署（逐步）
