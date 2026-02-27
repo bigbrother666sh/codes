@@ -57,7 +57,9 @@ else
   ARCH=$(dpkg --print-architecture)
   GO_TAR="go${GO_VERSION}.linux-${ARCH}.tar.gz"
 
-  wget -q "https://go.dev/dl/${GO_TAR}" -O "/tmp/${GO_TAR}"
+  # 优先使用国内镜像下载 Go，失败则回退官方源
+  wget -q "https://golang.google.cn/dl/${GO_TAR}" -O "/tmp/${GO_TAR}" 2>/dev/null \
+    || wget -q "https://go.dev/dl/${GO_TAR}" -O "/tmp/${GO_TAR}"
   sudo rm -rf /usr/local/go
   sudo tar -C /usr/local -xzf "/tmp/${GO_TAR}"
   rm -f "/tmp/${GO_TAR}"
@@ -65,6 +67,9 @@ else
   # 写入 profile（幂等）
   if ! grep -q '/usr/local/go/bin' "$HOME/.profile" 2>/dev/null; then
     echo 'export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin' >> "$HOME/.profile"
+  fi
+  if ! grep -q 'GOPROXY' "$HOME/.profile" 2>/dev/null; then
+    echo 'export GOPROXY=https://goproxy.cn,https://goproxy.io,direct' >> "$HOME/.profile"
   fi
   export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin
 
@@ -104,6 +109,13 @@ else
 fi
 
 cd "$CODES_DIR"
+
+# 设置 Go 模块代理（国内服务器必需，否则 github.com 依赖下载极慢/超时）
+export GOPROXY=https://goproxy.cn,https://goproxy.io,direct
+export GONOSUMDB=*
+info "使用 Go 模块代理: $GOPROXY"
+
+go mod download
 go build -o codes ./cmd/codes
 sudo cp codes /usr/local/bin/codes
 ok "codes 已构建并安装到 /usr/local/bin/codes"
