@@ -36,6 +36,10 @@ if (!fs.existsSync(bridgeJsonPath)) {
 // Ensure logs dir
 fs.mkdirSync(`${HOME}/.codes/logs`, { recursive: true });
 
+// Check for bridge.env (API credentials for systemd)
+const bridgeEnvPath = path.join(HOME, '.codes', 'bridge.env');
+const hasBridgeEnv = fs.existsSync(bridgeEnvPath);
+
 const platform = os.platform();
 
 if (platform === 'darwin') {
@@ -93,6 +97,7 @@ if (platform === 'darwin') {
 
 } else if (platform === 'linux') {
   // ─── Linux: systemd user unit ───
+  const envFileLine = hasBridgeEnv ? `EnvironmentFile=${bridgeEnvPath}` : '';
   const unit = `[Unit]
 Description=Codes Feishu Bridge
 After=network.target
@@ -104,8 +109,8 @@ WorkingDirectory=${WORK_DIR}
 Restart=always
 RestartSec=5
 Environment=HOME=${HOME}
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
-
+Environment=PATH=${HOME}/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+${envFileLine}
 StandardOutput=append:${HOME}/.codes/logs/feishu-bridge.out.log
 StandardError=append:${HOME}/.codes/logs/feishu-bridge.err.log
 

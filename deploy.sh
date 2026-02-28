@@ -184,7 +184,15 @@ SETTINGSEOF
   echo "  建议写入 ~/.profile 或 ~/.bashrc"
 fi
 
-# 写入环境变量（幂等）
+# 写入 bridge.env（供 systemd 服务读取）
+cat > "$HOME/.codes/bridge.env" << ENVEOF
+ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}
+ANTHROPIC_API_KEY=${ANTHROPIC_AUTH_TOKEN}
+ENVEOF
+chmod 600 "$HOME/.codes/bridge.env"
+ok "API 环境变量已写入 ~/.codes/bridge.env"
+
+# 同时写入 ~/.bashrc（供 SSH 登录后手动使用 claude 命令）
 if ! grep -q 'ANTHROPIC_BASE_URL' "$HOME/.bashrc" 2>/dev/null; then
   {
     echo ""
