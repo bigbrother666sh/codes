@@ -185,14 +185,14 @@ SETTINGSEOF
 fi
 
 # 写入环境变量（幂等）
-if ! grep -q 'ANTHROPIC_BASE_URL' "$HOME/.profile" 2>/dev/null; then
+if ! grep -q 'ANTHROPIC_BASE_URL' "$HOME/.bashrc" 2>/dev/null; then
   {
     echo ""
     echo "# Claude Code API"
     echo "export ANTHROPIC_BASE_URL=\"${ANTHROPIC_BASE_URL}\""
     echo "export ANTHROPIC_API_KEY=\"${ANTHROPIC_AUTH_TOKEN}\""
-  } >> "$HOME/.profile"
-  ok "API 环境变量已写入 ~/.profile"
+  } >> "$HOME/.bashrc"
+  ok "API 环境变量已写入 ~/.bashrc"
 fi
 
 # ─── 创建 systemd 服务 ───────────────────────────────────────────

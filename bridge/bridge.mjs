@@ -783,6 +783,19 @@ class ProjectManager {
     return { ok: true, message: `${alias} 已停止` };
   }
 
+  async resetProject(alias) {
+    const proj = this._projects.get(alias);
+    if (!proj) return { ok: false, error: `未知项目: ${alias}` };
+    await proj.claude.stop();
+    proj.claude._sessionId = null;
+    proj.claude._costUsd = 0;
+    proj.claude._turnCount = 0;
+    proj.claude.restart();
+    proj.started = true;
+    this._saveSessions();
+    return { ok: true, message: `${alias} 会话已重置，下次对话将开始新会话` };
+  }
+
   async startAll() {
     const results = [];
     for (const alias of this._projects.keys()) {
@@ -1403,8 +1416,11 @@ async function handleSlashCommand(pm, alias, text) {
         '',
         '/start [alias|all]  — 启动项目的 Claude Code',
         '/stop [alias|all]   — 停止项目的 Claude Code',
+        '/reset [alias]      — 重置会话（清除历史，开始新对话）',
         '/status             — 查看所有项目状态',
         '/help               — 显示此帮助',
+        '',
+        '其他 / 开头的消息会直接转发给 Claude Code。',
         '',
         `当前项目: ${alias}`,
         `所有项目: ${pm.aliases().join(', ')}`,
@@ -1447,7 +1463,14 @@ async function handleSlashCommand(pm, alias, text) {
     return { text: r.ok ? r.message : `错误: ${r.error}` };
   }
 
-  return { text: `未知命令: ${cmd}\n输入 /help 查看帮助` };
+  if (cmd === '/reset') {
+    const target = arg || alias;
+    const r = await pm.resetProject(target);
+    return { text: r.ok ? r.message : `错误: ${r.error}` };
+  }
+
+  // Unknown slash command — pass through to Claude Code as normal message
+  return null;
 }
 
 // ─── Message handler factory ─────────────────────────────────────
@@ -1516,7 +1539,18 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
 
           if (isSlash) {
             const r = await handleSlashCommand(pm, alias, trimmed);
-            replyText = String(r?.text ?? '');
+            if (r) {
+              replyText = String(r.text ?? '');
+            } else {
+              // Unknown slash command — pass through to Claude Code
+              const proj = pm.getProject(alias);
+              if (!proj || !proj.started) {
+                replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
+              } else {
+                const result = await proj.claude.sendMessage(trimmed);
+                replyText = String(result?.text ?? '');
+              }
+            }
           } else {
             const proj = pm.getProject(alias);
             if (!proj || !proj.started) {
