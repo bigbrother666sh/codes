@@ -1,31 +1,48 @@
 /**
- * Generate a macOS launchd plist to keep the Feishu bridge running.
+ * Generate a macOS launchd plist (or Linux systemd unit) to keep the Feishu bridge running.
+ *
+ * Prerequisites:
+ *   1. Create ~/.codes/bridge.json (see bridge.example.json)
+ *   2. Create secret files referenced in bridge.json
  *
  * Usage:
- *   FEISHU_APP_ID=cli_xxx node setup-service.mjs
+ *   node setup-service.mjs
  *
- * Then:
+ * Then (macOS):
  *   launchctl load ~/Library/LaunchAgents/com.codes.feishu-bridge.plist
+ *
+ * Or (Linux):
+ *   systemctl --user enable codes-feishu-bridge
+ *   systemctl --user start codes-feishu-bridge
  */
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const APP_ID = process.env.FEISHU_APP_ID;
-if (!APP_ID) {
-  console.error('Please set FEISHU_APP_ID environment variable');
+const HOME = os.homedir();
+const NODE_PATH = process.execPath; // e.g. /opt/homebrew/bin/node or /usr/bin/node
+const BRIDGE_PATH = path.resolve(import.meta.dirname, 'bridge.mjs');
+const WORK_DIR = path.resolve(import.meta.dirname);
+
+// Check bridge.json exists
+const bridgeJsonPath = path.join(HOME, '.codes', 'bridge.json');
+if (!fs.existsSync(bridgeJsonPath)) {
+  console.error(`[ERROR] ~/.codes/bridge.json not found.`);
+  console.error(`Create it first — see bridge.example.json for a template.`);
   process.exit(1);
 }
 
-const HOME = os.homedir();
-const NODE_PATH = process.execPath; // e.g. /opt/homebrew/bin/node
-const BRIDGE_PATH = path.resolve(import.meta.dirname, 'bridge.mjs');
-const WORK_DIR = path.resolve(import.meta.dirname);
-const LABEL = 'com.codes.feishu-bridge';
-const SECRET_PATH = process.env.FEISHU_APP_SECRET_PATH || `${HOME}/.codes/secrets/feishu_app_secret`;
+// Ensure logs dir
+fs.mkdirSync(`${HOME}/.codes/logs`, { recursive: true });
 
-const plist = `<?xml version="1.0" encoding="UTF-8"?>
+const platform = os.platform();
+
+if (platform === 'darwin') {
+  // ─── macOS: launchd plist ───
+  const LABEL = 'com.codes.feishu-bridge';
+
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
   <dict>
@@ -53,10 +70,6 @@ const plist = `<?xml version="1.0" encoding="UTF-8"?>
       <string>${HOME}</string>
       <key>PATH</key>
       <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-      <key>FEISHU_APP_ID</key>
-      <string>${APP_ID}</string>
-      <key>FEISHU_APP_SECRET_PATH</key>
-      <string>${SECRET_PATH}</string>
     </dict>
 
     <key>StandardOutPath</key>
@@ -67,16 +80,58 @@ const plist = `<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 `;
 
-// Ensure logs dir
-fs.mkdirSync(`${HOME}/.codes/logs`, { recursive: true });
+  const outPath = path.join(HOME, 'Library', 'LaunchAgents', `${LABEL}.plist`);
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, plist);
+  console.log(`Wrote: ${outPath}`);
+  console.log();
+  console.log('To start the service:');
+  console.log(`  launchctl load ${outPath}`);
+  console.log();
+  console.log('To stop:');
+  console.log(`  launchctl unload ${outPath}`);
 
-const outPath = path.join(HOME, 'Library', 'LaunchAgents', `${LABEL}.plist`);
-fs.mkdirSync(path.dirname(outPath), { recursive: true });
-fs.writeFileSync(outPath, plist);
-console.log(`Wrote: ${outPath}`);
-console.log();
-console.log('To start the service:');
-console.log(`  launchctl load ${outPath}`);
-console.log();
-console.log('To stop:');
-console.log(`  launchctl unload ${outPath}`);
+} else if (platform === 'linux') {
+  // ─── Linux: systemd user unit ───
+  const unit = `[Unit]
+Description=Codes Feishu Bridge
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${NODE_PATH} ${BRIDGE_PATH}
+WorkingDirectory=${WORK_DIR}
+Restart=always
+RestartSec=5
+Environment=HOME=${HOME}
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+StandardOutput=append:${HOME}/.codes/logs/feishu-bridge.out.log
+StandardError=append:${HOME}/.codes/logs/feishu-bridge.err.log
+
+[Install]
+WantedBy=default.target
+`;
+
+  const unitDir = path.join(HOME, '.config', 'systemd', 'user');
+  fs.mkdirSync(unitDir, { recursive: true });
+  const outPath = path.join(unitDir, 'codes-feishu-bridge.service');
+  fs.writeFileSync(outPath, unit);
+  console.log(`Wrote: ${outPath}`);
+  console.log();
+  console.log('To enable and start:');
+  console.log('  systemctl --user daemon-reload');
+  console.log('  systemctl --user enable codes-feishu-bridge');
+  console.log('  systemctl --user start codes-feishu-bridge');
+  console.log();
+  console.log('To stop:');
+  console.log('  systemctl --user stop codes-feishu-bridge');
+  console.log();
+  console.log('To view logs:');
+  console.log('  journalctl --user -u codes-feishu-bridge -f');
+
+} else {
+  console.error(`Unsupported platform: ${platform}`);
+  console.error('Manually run: node bridge.mjs');
+  process.exit(1);
+}

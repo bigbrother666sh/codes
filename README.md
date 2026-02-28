@@ -1,380 +1,188 @@
-# Codes CLI
+# Codes — 飞书 × Claude Code Bridge
 
-[English](README.md) | [中文](README.zh-CN.md)
+通过飞书机器人操控服务器上的 Claude Code，让 AI 编程助手随时在线。
 
-Environment configuration management, project management, and multi-agent collaboration tool for Claude Code. Switch API profiles instantly, manage project workspaces, and orchestrate autonomous agent teams to tackle complex tasks in parallel.
+## 架构
 
-## Features
-
-- **Profile Switching** — Manage multiple API configurations (Anthropic, proxies, custom endpoints) and switch instantly
-- **Project Management** — Project aliases, workspace management, interactive TUI
-- **Agent Teams** — Autonomous Claude agents collaborating with task dependencies, messaging, and auto-reporting
-- **Workflow Templates** — YAML-based agent team templates for repeatable multi-agent pipelines
-- **Cost Tracking** — Session-level API usage statistics by project and model
-- **HTTP REST API** — Full REST API server (`codes serve`) for remote access, mobile clients, and WebSocket-based chat sessions
-- **MCP Server** — 43 tools over stdio + SSE (served at `/mcp/` on same port as HTTP, no extra port needed)
-- **Cross-Platform** — Linux, macOS, Windows (amd64 & arm64)
-
-## Install
-
-```bash
-# Linux / macOS
-curl -fsSL https://raw.githubusercontent.com/ourines/codes/main/install.sh | sh
-
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/ourines/codes/main/install.ps1 | iex
-
-# From source (Go 1.24+)
-git clone https://github.com/ourines/codes.git && cd codes && make build
+```
+飞书用户 ──WebSocket──▶ bridge.mjs ──stdin/stdout──▶ Claude Code CLI
+                         │                              │
+                    ProjectManager                 ClaudeProcess
+                    (多项目管理)                  (stream-json 协议)
 ```
 
-Then run `codes init` to set up shell completion and PATH.
+- **bridge.mjs** — 单 Node.js 进程，同时服务多个飞书 bot + 多个 Claude Code 子进程
+- **ClaudeProcess** — 通过 `stream-json` 协议与 Claude CLI 通信，支持会话持久化和自动重启
+- **ProjectManager** — 管理多项目生命周期，每个项目独立的 Claude 实例和飞书 bot
 
-## Claude Code Integration
+## 前置要求
 
-Add `codes` as an MCP server to let Claude Code manage agent teams, projects, and profiles directly.
+- **Node.js** 18+（推荐 22）
+- **Claude Code CLI** — `npm install -g @anthropic-ai/claude-code`
+- **飞书自建应用** — 需要 App ID + App Secret（详见下方配置步骤）
 
-**Project-level** (`.mcp.json` in project root):
+## 快速开始
+
+### 1. 克隆仓库
+
+```bash
+git clone https://github.com/bigbrother666sh/codes.git
+cd codes/bridge
+npm install
+```
+
+### 2. 创建配置文件
+
+```bash
+mkdir -p ~/.codes/secrets
+cp bridge.example.json ~/.codes/bridge.json
+```
+
+编辑 `~/.codes/bridge.json`：
 
 ```json
 {
-  "mcpServers": {
-    "codes": {
-      "command": "codes",
-      "args": ["serve"]
-    }
-  }
-}
-```
-
-**User-level** (`~/.claude/claude_code_config.json`):
-
-```json
-{
-  "mcpServers": {
-    "codes": {
-      "command": "codes",
-      "args": ["serve"]
-    }
-  }
-}
-```
-
-Once configured, Claude Code gains access to 43 MCP tools:
-
-| Category | Tools | Examples |
-|----------|-------|---------|
-| **Config** (10) | Projects, profiles, remotes | `list_projects`, `switch_profile`, `sync_remote` |
-| **Agent** (25) | Teams, tasks, messages | `team_create`, `task_create`, `message_send` |
-| **Stats** (4) | Usage tracking | `stats_summary`, `stats_by_project`, `stats_by_model` |
-| **Workflow** (4) | Templates | `workflow_list`, `workflow_run`, `workflow_create` |
-
-Usage in Claude Code:
-
-```
-You: Create a team to refactor the auth module
-
-Claude: I'll set up a team with a coder and tester...
-        [uses team_create, agent_add, task_create tools]
-
-You: What's the status?
-
-Claude: [uses team_status tool]
-        The coder completed 2/3 tasks. Tester is waiting on task #3.
-```
-
-## Quick Start: Agent Teams
-
-```bash
-# Create a team with agents
-codes agent team create myteam --workdir ~/Projects/myproject
-codes agent add myteam coder --role "implementation" --model sonnet
-codes agent add myteam tester --role "testing" --model sonnet
-
-# Start agents and create tasks
-codes agent start-all myteam
-codes agent task create myteam "Implement login API" --assign coder --priority high
-codes agent task create myteam "Write login tests" --assign tester --blocked-by 1
-
-# Monitor and clean up
-codes agent status myteam
-codes agent stop-all myteam
-```
-
-### How It Works
-
-Agents run as independent daemon processes, polling a shared file-based task queue every 3 seconds. Each agent executes tasks by spawning Claude CLI subprocesses and auto-reports results to the team.
-
-All state lives in `~/.codes/teams/<name>/` as JSON files — no databases, no message brokers. Filesystem atomic renames guarantee safe concurrent access.
-
-## Workflow Templates
-
-Workflows are reusable YAML templates that define agent teams and tasks. Running a workflow creates a team, starts agents, and queues tasks — all in one command.
-
-```bash
-# List available workflows
-codes workflow list
-
-# Run a built-in workflow
-codes workflow run pre-pr-check
-
-# Create your own
-codes workflow create my-pipeline
-```
-
-Example workflow YAML (`~/.codes/workflows/my-pipeline.yml`):
-
-```yaml
-name: my-pipeline
-description: Build, test, and review
-agents:
-  - name: builder
-    role: Build and compile the project
-  - name: tester
-    role: Run tests and report failures
-  - name: reviewer
-    role: Review code quality
-tasks:
-  - subject: Build project
-    assign: builder
-    prompt: Run the build and fix any compilation errors
-  - subject: Run tests
-    assign: tester
-    prompt: Execute the test suite and report results
-    blocked_by: [1]
-  - subject: Code review
-    assign: reviewer
-    prompt: Review recent changes for quality issues
-    blocked_by: [1]
-```
-
-Workflows can also be created programmatically via the `workflow_create` MCP tool.
-
-## HTTP REST API Server
-
-`codes serve` starts the full daemon — no flags needed. Everything runs on a **single port** (default `:3456`):
-
-| Service | Address |
-|---------|---------|
-| HTTP REST API | `http://host:3456/` |
-| MCP SSE | `http://host:3456/mcp/` |
-| stdio MCP | Auto-detected (when stdin is a pipe, e.g. Claude Code MCP config) |
-| Assistant scheduler | Background goroutine |
-
-**First run** auto-generates and saves an auth token to `~/.codes/config.json`. All endpoints (except `/health`) require:
-
-```
-Authorization: Bearer <token>
-```
-
-### Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Health check (no auth) |
-| `GET/POST` | `/sessions` | List / create chat sessions |
-| `GET/DELETE` | `/sessions/{id}` | Get / delete session |
-| `GET` | `/sessions/{id}/ws` | WebSocket stream (real-time I/O) |
-| `POST` | `/sessions/{id}/message` | Send message to session |
-| `POST` | `/sessions/{id}/interrupt` | Interrupt running session |
-| `POST` | `/sessions/{id}/resume` | Resume paused session |
-| `GET` | `/projects` | List projects |
-| `GET` | `/projects/{name}` | Get project details |
-| `GET` | `/profiles` | List profiles |
-| `POST` | `/profiles/switch` | Switch active profile |
-| `GET` | `/stats/summary` | Cost summary |
-| `GET` | `/stats/projects` | Cost by project |
-| `GET` | `/stats/models` | Cost by model |
-| `POST` | `/stats/refresh` | Rebuild stats cache |
-| `GET` | `/workflows` | List workflows |
-| `GET` | `/workflows/{name}` | Get workflow |
-| `POST` | `/workflows/{name}/run` | Run workflow |
-| `GET/POST` | `/teams` | List / create team definitions |
-| `GET/PUT/DELETE` | `/teams/{name}` | Get / update / delete team definition |
-| `POST` | `/teams/{name}/spawn` | Spawn a run from team template |
-| `GET/POST` | `/runs` | List / create runs |
-| `GET/DELETE` | `/runs/{name}` | Get / delete run |
-| `GET/POST` | `/runs/{name}/tasks` | List / create run tasks |
-| `PUT` | `/runs/{name}/tasks/{id}` | Update run task |
-| `GET/POST` | `/runs/{name}/messages` | List / send run messages |
-| `POST` | `/runs/{name}/start` | Start run agents |
-| `POST` | `/runs/{name}/stop` | Stop run agents |
-| `GET` | `/runs/{name}/activity` | Run activity stream |
-| `GET` | `/tasks/{team}/{id}` | Get task by team and ID |
-| `POST` | `/feishu/webhook` | Feishu inbound webhook (no auth) |
-| `POST` | `/assistant` | Assistant endpoint |
-
-### Configuration
-
-Add to `~/.codes/config.json` to pin the bind address or pre-set tokens:
-
-```json
-{
-  "httpBind": ":3456",
-  "httpTokens": ["your-secret-token"]
-}
-```
-
-## Commands
-
-```
-codes                                    # Launch TUI (when TTY detected)
-codes init [--yes]                       # Install binary + shell completion
-codes start <path|alias>                 # Launch Claude in directory (alias: s)
-codes version / update                   # Version info / update Claude CLI
-codes doctor                             # System diagnostics
-codes serve                              # Start full daemon (HTTP :3456 + SSE MCP /mcp/ + scheduler)
-```
-
-### Profile Management (`codes profile`, alias: `pf`)
-
-```bash
-codes profile add                        # Add new profile interactively
-codes profile select                     # Switch active profile
-codes profile test [name]                # Test connectivity
-codes profile list / remove <name>
-```
-
-### Project Aliases (`codes project`, alias: `p`)
-
-```bash
-codes project add [name] [path]          # Add project alias
-codes project list / remove <name>
-```
-
-### Configuration (`codes config`, alias: `c`)
-
-```bash
-codes config get [key]                   # Show settings
-codes config set <key> <value>           # Set value
-codes config list <key>                  # List available values
-codes config reset [key]                 # Reset to default
-codes config export / import <file>      # Export/import configuration
-```
-
-| Key | Values | Description |
-|-----|--------|-------------|
-| `default-behavior` | `current`, `last`, `home` | Startup directory |
-| `skip-permissions` | `true`, `false` | Skip permission prompts |
-| `terminal` | `terminal`, `iterm`, `warp` | Terminal emulator |
-
-### Agent Teams (`codes agent`, alias: `a`)
-
-```bash
-# Teams
-codes agent team create <name> [--workdir <path>] [--description <text>]
-codes agent team list / info <name> / delete <name>
-codes agent status <name>                # Team dashboard
-
-# Agents
-codes agent add <team> <name> [--role <role>] [--model <model>] [--type worker|leader]
-codes agent remove <team> <name>
-codes agent start|stop <team> <name>
-codes agent start-all|stop-all <team>
-
-# Tasks
-codes agent task create <team> <subject> [--assign <agent>] [--priority high|normal|low] [--blocked-by <ids>]
-codes agent task list <team> [--status <status>] [--owner <agent>]
-codes agent task get <team> <id> / cancel <team> <id>
-
-# Messages
-codes agent message send <team> <content> --from <agent> [--to <agent>]
-codes agent message list <team> --agent <name>
-```
-
-### Workflow Templates (`codes workflow`, alias: `wf`)
-
-```bash
-codes workflow list                      # List all workflows
-codes workflow run <name> [-d <dir>] [-m <model>] [-p <project>]
-codes workflow create <name>             # Create template
-codes workflow delete <name>
-```
-
-### Cost Tracking (`codes stats`, alias: `st`)
-
-```bash
-codes stats summary [period]             # Cost summary (today/week/month/all)
-codes stats project [name]               # Cost by project
-codes stats model                        # Cost by model
-codes stats refresh                      # Force cache rebuild
-```
-
-### Remote Hosts (`codes remote`, alias: `r`)
-
-```bash
-codes remote add <name> <user@host>
-codes remote list / status <name>
-codes remote setup <name> / ssh <name>
-```
-
-## Configuration
-
-Config file location: `~/.codes/config.json` (fallback: `./config.json`)
-
-```json
-{
-  "profiles": [
-    {
-      "name": "work",
-      "env": {
-        "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
-        "ANTHROPIC_AUTH_TOKEN": "sk-ant-xxxxx"
+  "projects": {
+    "myapp": {
+      "path": "/home/user/projects/myapp",
+      "feishu": {
+        "appId": "cli_xxx",
+        "appSecretPath": "~/.codes/secrets/myapp_secret"
       }
     }
-  ],
-  "default": "work",
-  "defaultBehavior": "current",
-  "terminal": "terminal",
-  "projects": { "my-project": "/path/to/project" }
+  },
+  "claudePath": "claude",
+  "debug": false
 }
 ```
 
-<details>
-<summary>Supported environment variables</summary>
-
-| Variable | Description |
-|----------|-------------|
-| `ANTHROPIC_BASE_URL` | API endpoint URL |
-| `ANTHROPIC_AUTH_TOKEN` | Authentication token |
-| `ANTHROPIC_API_KEY` | API key (alternative auth) |
-| `ANTHROPIC_MODEL` | Default model |
-| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Haiku model override |
-| `ANTHROPIC_DEFAULT_SONNET_MODEL` | Sonnet model override |
-| `ANTHROPIC_DEFAULT_OPUS_MODEL` | Opus model override |
-| `MAX_THINKING_TOKENS` | Maximum thinking tokens |
-| `HTTP_PROXY` / `HTTPS_PROXY` | Proxy settings |
-
-</details>
-
-## Development
-
-```
-codes/
-├── cmd/codes/          # Entry point
-├── internal/
-│   ├── agent/          # Agent teams: daemon, runner, storage
-│   ├── chatsession/    # Claude chat session lifecycle + WebSocket streaming
-│   ├── commands/       # Cobra CLI commands
-│   ├── config/         # Configuration management
-│   ├── dispatch/       # Intent-based task dispatch to agent teams
-│   ├── httpserver/     # HTTP REST API server (sessions, projects, stats, workflows)
-│   ├── mcp/            # MCP server (43 tools, stdio transport)
-│   ├── session/        # Terminal session manager
-│   ├── stats/          # Cost tracking and aggregation
-│   ├── remote/         # SSH remote management
-│   ├── tui/            # Interactive TUI (bubbletea)
-│   ├── ui/             # CLI output helpers
-│   └── workflow/       # Workflow templates and orchestration
-└── .github/workflows/  # CI/CD
-```
+将飞书 App Secret 写入 secret 文件：
 
 ```bash
-make build    # Build binary
-make test     # Run tests
-go vet ./...  # Lint
+echo -n "your-app-secret" > ~/.codes/secrets/myapp_secret
+chmod 600 ~/.codes/secrets/myapp_secret
 ```
+
+### 3. 启动
+
+```bash
+node bridge.mjs
+```
+
+## 配置说明
+
+### bridge.json 字段
+
+| 字段 | 说明 | 默认值 |
+|------|------|--------|
+| `projects` | 项目配置 map（alias → {path, feishu}） | 必填 |
+| `projects.*.path` | 项目代码仓路径 | 必填 |
+| `projects.*.feishu.appId` | 飞书 App ID | 必填 |
+| `projects.*.feishu.appSecretPath` | Secret 文件路径 | 必填 |
+| `thinkingThresholdMs` | thinking 状态提示阈值（ms） | 2500 |
+| `claudePath` | Claude CLI 路径 | `"claude"` |
+| `debug` | 调试模式 | `false` |
+
+### .env 调优（可选）
+
+参见 `bridge/.env.example`。可通过环境变量覆盖 bridge.json 中的值：
+
+```bash
+FEISHU_THINKING_THRESHOLD_MS=2500    # thinking 状态提示阈值
+FEISHU_BRIDGE_DEBUG=1                # 调试模式
+FEISHU_BRIDGE_MAX_LOCAL_FILE_MB=15   # 本地文件大小限制
+FEISHU_BRIDGE_MAX_INBOUND_IMAGE_MB=12  # 入站图片大小限制
+FEISHU_BRIDGE_MAX_INBOUND_FILE_MB=40   # 入站文件大小限制
+```
+
+### 飞书自建应用创建步骤
+
+1. 前往 [飞书开放平台](https://open.feishu.cn/app) → 创建自建应用
+2. 在「权限管理」中添加：
+   - `im:message` — 接收消息
+   - `im:message:send_as_bot` — 以机器人身份发送消息
+   - `im:resource` — 读取资源（图片/文件）
+3. 在「事件与回调」中启用 **WebSocket 模式**（长连接，无需公网 IP）
+4. 记录 App ID 和 App Secret
+5. 发布应用版本
+
+## 飞书命令
+
+在飞书中向 bot 发送以下命令：
+
+| 命令 | 说明 |
+|------|------|
+| `/start [alias\|all]` | 启动项目的 Claude Code |
+| `/stop [alias\|all]` | 停止项目的 Claude Code |
+| `/status` | 查看所有项目状态 |
+| `/help` | 显示帮助 |
+
+普通消息会直接发送给对应项目的 Claude Code 处理。
+
+## 服务���部署
+
+### 一键部署（Ubuntu 24.04）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bigbrother666sh/codes/main/deploy.sh | bash
+```
+
+脚本会自动安装 Node.js、Claude Code CLI，引导配置飞书凭据，并创建 systemd 服务。
+
+### 手动部署
+
+```bash
+# 1. 安装 Node.js 22
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
+
+# 2. 安装 Claude Code CLI
+npm install -g @anthropic-ai/claude-code
+
+# 3. 克隆并安装
+git clone https://github.com/bigbrother666sh/codes.git ~/codes
+cd ~/codes/bridge && npm install
+
+# 4. 配置（参见上方「快速开始」）
+
+# 5. 创建 systemd 服务
+node setup-service.mjs
+systemctl --user daemon-reload
+systemctl --user enable codes-feishu-bridge
+systemctl --user start codes-feishu-bridge
+```
+
+### 服务管理
+
+```bash
+# 查看状态
+systemctl --user status codes-feishu-bridge
+
+# 查看日志
+journalctl --user -u codes-feishu-bridge -f
+
+# 重启
+systemctl --user restart codes-feishu-bridge
+```
+
+## 故障排查
+
+| 症状 | 排查方法 |
+|------|----------|
+| bridge 启动后无反应 | 检查 `~/.codes/bridge.json` 格式，确认 secret 文件存在 |
+| 飞书消息无响应 | 检查飞书应用权限，确认 WebSocket 模式已启用 |
+| Claude 报错 | 确认 `claude --version` 可运行，检查 `~/.claude/settings.json` 配置 |
+| 进程重启后会话丢失 | 正常行为——bridge 会自动以 `--resume` 恢复上次会话 |
+| 多项目配置不生效 | 确认每个项目的 `feishu.appId` 不同，每个 bot 对应一个项目 |
+
+## 自测
+
+```bash
+node bridge/bridge.mjs --selftest
+```
+
+验证配置加载和基本功能，不会连接飞书。
 
 ## License
 
-[MIT License](LICENSE)
+MIT

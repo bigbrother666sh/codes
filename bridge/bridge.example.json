@@ -1,0 +1,21 @@
+{
+  "projects": {
+    "myapp": {
+      "path": "/home/user/projects/myapp",
+      "feishu": {
+        "appId": "cli_xxx",
+        "appSecretPath": "~/.codes/secrets/myapp_secret"
+      }
+    },
+    "backend": {
+      "path": "/home/user/projects/backend",
+      "feishu": {
+        "appId": "cli_yyy",
+        "appSecretPath": "~/.codes/secrets/backend_secret"
+      }
+    }
+  },
+  "thinkingThresholdMs": 2500,
+  "claudePath": "claude",
+  "debug": false
+}

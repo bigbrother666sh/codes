@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Codes + Feishu Bridge — Ubuntu 24.04 一键部署脚本
+# Feishu-Claude Bridge — Ubuntu 24.04 一键部署脚本
 #
 # 用法:
 #   curl -fsSL <url>/deploy.sh | bash
 #   或: chmod +x deploy.sh && ./deploy.sh
 #
-# 前置要求: 一台全新的 Ubuntu 24.04 服务器 + root/sudo 权限
+# 前置要求: Ubuntu 24.04 服务器 + root/sudo 权限
 # ============================================================================
 
 set -euo pipefail
@@ -20,77 +20,42 @@ err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 fatal() { err "$*"; exit 1; }
 
 # ─── 配置变量 ─────────────────────────────────────────────────────
-GO_VERSION="1.24.2"
 NODE_MAJOR=22
 CODES_REPO="https://github.com/bigbrother666sh/codes.git"
 CODES_DIR="$HOME/codes"
-CODES_HTTP_PORT=3456
 
 # ─── 检测环境 ─────────────────────────────────────────────────────
 echo ""
 echo "============================================"
-echo "  Codes + Feishu Bridge 一键部署"
+echo "  Feishu-Claude Bridge 一键部署"
 echo "  目标: Ubuntu 24.04"
 echo "============================================"
 echo ""
 
 if [ "$(id -u)" = "0" ]; then
   warn "检测到 root 用户运行。建议使用普通用户 + sudo。"
-  warn "脚本将继续，但 Claude Code 建议以非 root 运行。"
   echo ""
 fi
 
 # ─── Phase 1: 系统依赖 ────────────────────────────────────────────
-info "Phase 1/7: 安装系统依赖..."
+info "Phase 1/5: 安装系统依赖..."
 
 sudo apt-get update -qq
-sudo apt-get install -y -qq git curl wget build-essential jq unzip > /dev/null 2>&1
+sudo apt-get install -y -qq git curl jq > /dev/null 2>&1
 ok "系统依赖已安装"
 
-# ─── Phase 2: Go ──────────────────────────────────────────────────
-info "Phase 2/7: 安装 Go ${GO_VERSION}..."
-
-if command -v go &>/dev/null; then
-  CURRENT_GO=$(go version | awk '{print $3}' | sed 's/go//')
-  ok "Go 已安装: ${CURRENT_GO}"
-else
-  ARCH=$(dpkg --print-architecture)
-  GO_TAR="go${GO_VERSION}.linux-${ARCH}.tar.gz"
-
-  # 优先使用国内镜像下载 Go，失败则回退官方源
-  wget -q "https://golang.google.cn/dl/${GO_TAR}" -O "/tmp/${GO_TAR}" 2>/dev/null \
-    || wget -q "https://go.dev/dl/${GO_TAR}" -O "/tmp/${GO_TAR}"
-  sudo rm -rf /usr/local/go
-  sudo tar -C /usr/local -xzf "/tmp/${GO_TAR}"
-  rm -f "/tmp/${GO_TAR}"
-
-  # 写入 profile（幂等）
-  if ! grep -q '/usr/local/go/bin' "$HOME/.profile" 2>/dev/null; then
-    echo 'export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin' >> "$HOME/.profile"
-  fi
-  if ! grep -q 'GOPROXY' "$HOME/.profile" 2>/dev/null; then
-    echo 'export GOPROXY=https://goproxy.cn,https://goproxy.io,direct' >> "$HOME/.profile"
-  fi
-  export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin
-
-  ok "Go $(go version | awk '{print $3}') 已安装"
-fi
-
-# ─── Phase 3: Node.js ────────────────────────────────────────────
-info "Phase 3/7: 安装 Node.js ${NODE_MAJOR}.x..."
+# ─── Phase 2: Node.js ────────────────────────────────────────────
+info "Phase 2/5: 安装 Node.js ${NODE_MAJOR}.x..."
 
 if command -v node &>/dev/null; then
   ok "Node.js 已安装: $(node --version)"
 else
-  # NodeSource 官方安装
   curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | sudo -E bash - > /dev/null 2>&1
   sudo apt-get install -y -qq nodejs > /dev/null 2>&1
   ok "Node.js $(node --version) 已安装"
 fi
 
-# ─── 配置 npm 用户级全局目录（使 Claude Code 可自动更新）────────
-info "配置 npm 用户级全局目录..."
-
+# 配置 npm 用户级全局目录（使 Claude Code 可自动更新）
 NPM_GLOBAL="$HOME/.npm-global"
 mkdir -p "$NPM_GLOBAL"
 npm config set prefix "$NPM_GLOBAL"
@@ -99,10 +64,9 @@ if ! grep -q '.npm-global/bin' "$HOME/.profile" 2>/dev/null; then
   echo 'export PATH=$HOME/.npm-global/bin:$PATH' >> "$HOME/.profile"
 fi
 export PATH="$NPM_GLOBAL/bin:$PATH"
-ok "npm 全局目录已配置: $NPM_GLOBAL"
 
-# ─── Phase 4: Claude Code CLI ────────────────────────────────────
-info "Phase 4/7: 安装 Claude Code CLI..."
+# ─── Phase 3: Claude Code CLI ────────────────────────────────────
+info "Phase 3/5: 安装 Claude Code CLI..."
 
 if command -v claude &>/dev/null; then
   ok "Claude Code 已安装: $(claude --version 2>/dev/null || echo 'unknown')"
@@ -111,8 +75,8 @@ else
   ok "Claude Code $(claude --version 2>/dev/null || echo '') 已安装"
 fi
 
-# ─── Phase 5: 构建 codes ─────────────────────────────────────────
-info "Phase 5/7: 克隆并构建 codes..."
+# ─── Phase 4: 克隆仓库 + 安装依赖 ────────────────────────────────
+info "Phase 4/5: 克隆仓库并安装依赖..."
 
 if [ -d "$CODES_DIR" ]; then
   info "codes 目录已存在，执行 git pull..."
@@ -121,27 +85,12 @@ else
   git clone "$CODES_REPO" "$CODES_DIR"
 fi
 
-cd "$CODES_DIR"
-
-# 设置 Go 模块代理（国内服务器必需，否则 github.com 依赖下载极慢/超时）
-export GOPROXY=https://goproxy.cn,https://goproxy.io,direct
-export GONOSUMDB=*
-info "使用 Go 模块代理: $GOPROXY"
-
-go mod download
-go build -o codes ./cmd/codes
-sudo cp codes /usr/local/bin/codes
-ok "codes 已构建并安装到 /usr/local/bin/codes"
-
-# ─── Phase 6: 安装 bridge 依赖 ───────────────────────────────────
-info "Phase 6/7: 安装 bridge Node.js 依赖..."
-
 cd "$CODES_DIR/bridge"
 npm install --production > /dev/null 2>&1
 ok "bridge 依赖已安装"
 
-# ─── Phase 7: 交互式配置 ──────────────────────────────────────────
-info "Phase 7/7: 配置..."
+# ─── Phase 5: 交互式配置 ──────────────────────────────────────────
+info "Phase 5/5: 配置..."
 
 echo ""
 echo "============================================"
@@ -149,8 +98,8 @@ echo "  现在需要你提供几个配置值"
 echo "============================================"
 echo ""
 
-# --- 7a: Anthropic API ---
-echo -e "${BLUE}[1/4] API 配置${NC}"
+# --- Claude Code 配置 ---
+echo -e "${BLUE}[1/3] Claude Code API 配置${NC}"
 echo "  你使用的是:"
 echo "    1) Anthropic 官方 API (api.anthropic.com)"
 echo "    2) 第三方代理 / 自部署 API"
@@ -168,101 +117,57 @@ else
   echo ""
 fi
 
-# --- 7b: Feishu ---
+# --- 飞书配置 ---
 echo ""
-echo -e "${BLUE}[2/4] 飞书配置${NC}"
+echo -e "${BLUE}[2/3] 飞书配置${NC}"
 read -rp "  飞书 App ID (cli_xxx): " FEISHU_APP_ID
 read -rsp "  飞书 App Secret: " FEISHU_APP_SECRET
 echo ""
 
-# --- 7c: HTTP Token ---
+# --- 项目配置 ---
 echo ""
-echo -e "${BLUE}[3/4] codes HTTP Token${NC}"
-CODES_TOKEN=$(openssl rand -hex 32)
-echo "  已自动生成 HTTP Token: ${CODES_TOKEN:0:8}..."
-read -rp "  使用此 token? (y/自定义输入) [y]: " TOKEN_CHOICE
-if [ "$TOKEN_CHOICE" != "y" ] && [ "$TOKEN_CHOICE" != "" ]; then
-  CODES_TOKEN="$TOKEN_CHOICE"
-fi
-
-# --- 7d: 项目代码仓目录 ---
-echo ""
-echo -e "${BLUE}[4/4] 项目代码仓目录${NC}"
-echo "  这是你要开发的项目 git 仓库存放的目录"
-echo "  例如: ~/projects/myapp, ~/projects/backend"
-echo "  (不是 codes 自身的数据目录，那个固定在 ~/.codes/)"
-read -rp "  项目存放目录 [${HOME}/projects]: " WORK_DIR
-WORK_DIR=${WORK_DIR:-"$HOME/projects"}
-mkdir -p "$WORK_DIR"
+echo -e "${BLUE}[3/3] 项目配置${NC}"
+read -rp "  项目别名 (如 myapp): " PROJECT_ALIAS
+PROJECT_ALIAS=${PROJECT_ALIAS:-myapp}
+read -rp "  项目代码仓路径 [${HOME}/projects/${PROJECT_ALIAS}]: " PROJECT_PATH
+PROJECT_PATH=${PROJECT_PATH:-"$HOME/projects/$PROJECT_ALIAS"}
+mkdir -p "$PROJECT_PATH"
 
 echo ""
 info "正在写入配置文件..."
 
-# ─── 写入 codes config ───────────────────────────────────────────
-mkdir -p "$HOME/.codes"
+# ─── 写入配置 ───────────────────────────────��─────────────────────
 mkdir -p "$HOME/.codes/secrets"
 mkdir -p "$HOME/.codes/logs"
-mkdir -p "$HOME/.codes/media"
 
-cat > "$HOME/.codes/config.json" << CODESEOF
+# 飞书 secret
+echo -n "$FEISHU_APP_SECRET" > "$HOME/.codes/secrets/${PROJECT_ALIAS}_secret"
+chmod 600 "$HOME/.codes/secrets/${PROJECT_ALIAS}_secret"
+ok "飞书 secret 已写入"
+
+# bridge.json
+cat > "$HOME/.codes/bridge.json" << BRIDGEEOF
 {
-  "profiles": [
-    {
-      "name": "default",
-      "env": {
-        "ANTHROPIC_BASE_URL": "${ANTHROPIC_BASE_URL}",
-        "ANTHROPIC_AUTH_TOKEN": "${ANTHROPIC_AUTH_TOKEN}"
-      },
-      "status": "active"
+  "projects": {
+    "${PROJECT_ALIAS}": {
+      "path": "${PROJECT_PATH}",
+      "feishu": {
+        "appId": "${FEISHU_APP_ID}",
+        "appSecretPath": "~/.codes/secrets/${PROJECT_ALIAS}_secret"
+      }
     }
-  ],
-  "default": "default",
-  "skipPermissions": true,
-  "defaultBehavior": "current",
-  "httpTokens": ["${CODES_TOKEN}"],
-  "httpBind": "127.0.0.1:${CODES_HTTP_PORT}",
-  "projects_dir": "${WORK_DIR}"
+  },
+  "claudePath": "claude",
+  "debug": false
 }
-CODESEOF
-chmod 600 "$HOME/.codes/config.json"
-ok "codes config 已写入: ~/.codes/config.json"
-
-# ─── 写入飞书 secret ─────────────────────────────────────────────
-echo -n "$FEISHU_APP_SECRET" > "$HOME/.codes/secrets/feishu_app_secret"
-chmod 600 "$HOME/.codes/secrets/feishu_app_secret"
-ok "飞书 secret 已写入: ~/.codes/secrets/feishu_app_secret"
-
-# ─── 写入 bridge .env ────────────────────────────────────────────
-cat > "$CODES_DIR/bridge/.env" << BRIDGEEOF
-FEISHU_APP_ID=${FEISHU_APP_ID}
-FEISHU_APP_SECRET_PATH=${HOME}/.codes/secrets/feishu_app_secret
-CODES_HTTP_PORT=${CODES_HTTP_PORT}
-CODES_HTTP_TOKEN=${CODES_TOKEN}
 BRIDGEEOF
-chmod 600 "$CODES_DIR/bridge/.env"
-ok "bridge .env 已写入"
+chmod 600 "$HOME/.codes/bridge.json"
+ok "bridge.json 已写入: ~/.codes/bridge.json"
 
 # ─── Claude Code 配置 ─────────────────────────────────────────────
-echo ""
-info "Claude Code 配置..."
 if [ -d "$HOME/.claude" ] && [ -f "$HOME/.claude/settings.json" ]; then
   ok "检测到已有 ~/.claude 配置，跳过"
 else
-  warn "未检测到 ~/.claude 配置"
-  echo ""
-  echo "  请从本地机器同步 Claude Code 配置到服务器:"
-  echo ""
-  echo "  # 在本地机器执行 (替换 user@server):"
-  echo "  rsync -avz --exclude='.credentials.json' \\"
-  echo "    --exclude='history.jsonl' --exclude='sessions/' \\"
-  echo "    --exclude='session-env/' --exclude='telemetry/' \\"
-  echo "    --exclude='debug/' --exclude='todos/' \\"
-  echo "    --exclude='plans/' --exclude='projects/' \\"
-  echo "    --exclude='.DS_Store' --exclude='paste-cache/' \\"
-  echo "    --exclude='file-history/' --exclude='backups/' \\"
-  echo "    ~/.claude/ user@server:~/.claude/"
-  echo ""
-  echo "  如果你没有现有配置，脚本会创建最小配置..."
   mkdir -p "$HOME/.claude"
   cat > "$HOME/.claude/settings.json" << 'SETTINGSEOF'
 {
@@ -271,84 +176,45 @@ else
 }
 SETTINGSEOF
   ok "已创建最小 Claude Code 配置"
+
+  warn "请确保设置 Claude Code 的 API 凭据:"
+  echo "  export ANTHROPIC_BASE_URL=\"${ANTHROPIC_BASE_URL}\""
+  echo "  export ANTHROPIC_API_KEY=\"${ANTHROPIC_AUTH_TOKEN}\""
+  echo ""
+  echo "  建议写入 ~/.profile 或 ~/.bashrc"
+fi
+
+# 写入环境变量（幂等）
+if ! grep -q 'ANTHROPIC_BASE_URL' "$HOME/.profile" 2>/dev/null; then
+  {
+    echo ""
+    echo "# Claude Code API"
+    echo "export ANTHROPIC_BASE_URL=\"${ANTHROPIC_BASE_URL}\""
+    echo "export ANTHROPIC_API_KEY=\"${ANTHROPIC_AUTH_TOKEN}\""
+  } >> "$HOME/.profile"
+  ok "API 环境变量已写入 ~/.profile"
 fi
 
 # ─── 创建 systemd 服务 ───────────────────────────────────────────
 info "创建 systemd 服务..."
 
-# codes-serve.service
-sudo tee /etc/systemd/system/codes-serve.service > /dev/null << SVCEOF
-[Unit]
-Description=Codes Serve Daemon (HTTP + MCP + Assistant)
-After=network.target
+cd "$CODES_DIR/bridge"
+node setup-service.mjs
 
-[Service]
-Type=simple
-User=$(whoami)
-WorkingDirectory=${WORK_DIR}
-ExecStart=/usr/local/bin/codes serve
-Restart=always
-RestartSec=5
-Environment=HOME=${HOME}
-Environment=PATH=${HOME}/.npm-global/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-
-# feishu-bridge.service
-sudo tee /etc/systemd/system/feishu-bridge.service > /dev/null << SVCEOF
-[Unit]
-Description=Feishu Codes Bridge
-After=network.target codes-serve.service
-Wants=codes-serve.service
-
-[Service]
-Type=simple
-User=$(whoami)
-WorkingDirectory=${CODES_DIR}/bridge
-ExecStart=$(which node) ${CODES_DIR}/bridge/bridge.mjs
-Restart=always
-RestartSec=5
-Environment=HOME=${HOME}
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
-EnvironmentFile=${CODES_DIR}/bridge/.env
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable codes-serve feishu-bridge
-ok "systemd 服务已创建并启用"
-
-# ─── 启动服务 ─────────────────────────────────────────────────────
 echo ""
-info "启动服务..."
+info "启用并启动服务..."
 
-sudo systemctl start codes-serve
+systemctl --user daemon-reload
+systemctl --user enable codes-feishu-bridge
+systemctl --user start codes-feishu-bridge
+
 sleep 2
 
-# 健康检查
-if curl -sf "http://127.0.0.1:${CODES_HTTP_PORT}/health" > /dev/null 2>&1; then
-  ok "codes serve 已启动 (端口 ${CODES_HTTP_PORT})"
-else
-  warn "codes serve 启动中，等待 5 秒..."
-  sleep 5
-  if curl -sf "http://127.0.0.1:${CODES_HTTP_PORT}/health" > /dev/null 2>&1; then
-    ok "codes serve 已启动 (端口 ${CODES_HTTP_PORT})"
-  else
-    err "codes serve 可能未正常启动，请检查: sudo journalctl -u codes-serve -f"
-  fi
-fi
-
-sudo systemctl start feishu-bridge
-sleep 2
-
-if systemctl is-active --quiet feishu-bridge; then
+if systemctl --user is-active --quiet codes-feishu-bridge; then
   ok "feishu-bridge 已启动"
 else
-  warn "feishu-bridge 可能未正常启动，请检查: sudo journalctl -u feishu-bridge -f"
+  warn "feishu-bridge 可能未正常启动，请检查:"
+  echo "  journalctl --user -u codes-feishu-bridge -f"
 fi
 
 # ─── 完成 ─────────────────────────────────────────────────────────
@@ -357,30 +223,23 @@ echo "============================================"
 echo -e "  ${GREEN}部署完成!${NC}"
 echo "============================================"
 echo ""
-echo "  服务状态:"
-echo "    sudo systemctl status codes-serve"
-echo "    sudo systemctl status feishu-bridge"
-echo ""
-echo "  查看日志:"
-echo "    sudo journalctl -u codes-serve -f"
-echo "    sudo journalctl -u feishu-bridge -f"
-echo ""
-echo "  手动测试 assistant API:"
-echo "    curl -H 'Authorization: Bearer ${CODES_TOKEN:0:8}...' \\"
-echo "         -X POST http://localhost:${CODES_HTTP_PORT}/assistant \\"
-echo "         -H 'Content-Type: application/json' \\"
-echo "         -d '{\"text\":\"你好\",\"session_id\":\"test\"}'"
+echo "  服务管理:"
+echo "    systemctl --user status codes-feishu-bridge"
+echo "    systemctl --user restart codes-feishu-bridge"
+echo "    journalctl --user -u codes-feishu-bridge -f"
 echo ""
 echo "  重要文件:"
-echo "    codes 配置:    ~/.codes/config.json"
-echo "    bridge 配置:   ${CODES_DIR}/bridge/.env"
-echo "    飞书 secret:   ~/.codes/secrets/feishu_app_secret"
-echo "    Claude Code:   ~/.claude/ (从本地 rsync 同步)"
+echo "    bridge 配置:   ~/.codes/bridge.json"
+echo "    飞书 secret:   ~/.codes/secrets/${PROJECT_ALIAS}_secret"
+echo "    Claude Code:   ~/.claude/"
+echo "    bridge 日志:   ~/.codes/logs/"
 echo ""
-echo "  防火墙 (仅需开放 SSH):"
-echo "    sudo ufw allow ssh && sudo ufw enable"
-echo "    codes serve 仅监听 127.0.0.1，无需额外端口"
-echo "    bridge 使用出站 WebSocket 连接飞书，无需入站端口"
+echo "  自测:"
+echo "    cd ${CODES_DIR}/bridge && node bridge.mjs --selftest"
+echo ""
+echo "  防火墙:"
+echo "    bridge 使用出站 WebSocket 连接飞书，无需开放入站端口"
+echo "    仅需开放 SSH: sudo ufw allow ssh && sudo ufw enable"
 echo ""
 echo "  现在去飞书发条消息试试吧!"
 echo ""

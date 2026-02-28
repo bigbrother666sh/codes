@@ -1,17 +1,24 @@
 /**
- * Feishu ↔ Codes Assistant Bridge
+ * Feishu ↔ Claude Code Bridge
  *
- * Receives messages from Feishu via WebSocket (long connection),
- * forwards them to codes assistant API (POST /assistant),
- * and sends the AI reply back.
+ * Directly manages Claude Code subprocesses for each project,
+ * with Feishu bots as the interaction UI.
  *
- * Design goals:
- * - Robust: never silently drop messages just because parsing failed.
- * - Long-term: tolerate Feishu rich-text (post/md/list) structure variations.
- * - Practical: handle images from (1) real Feishu image messages, (2) post embeds,
- *   (3) local markdown image paths produced by local automation (restricted allowlist).
- * - Optional: support "MEDIA:" outputs from the agent to send files back to Feishu
- *   with correct upload/send type mapping (avoids 230055).
+ * Architecture:
+ *   bridge.mjs (single Node.js process)
+ *     ├── loadBridgeConfig() — reads ~/.codes/bridge.json
+ *     ├── ClaudeProcess (one per project) — manages claude subprocess
+ *     │     ├── spawn: claude --output-format stream-json --input-format stream-json
+ *     │     ├── stdin: sends user messages (JSONL)
+ *     │     ├── stdout: reads event stream, detects type:"result" for turn completion
+ *     │     └── respawn: auto-restart with --resume <session-id> on next message
+ *     └── FeishuBot (one per project) — manages Feishu WebSocket connection
+ *           ├── Lark.Client + Lark.WSClient (one set per bot app)
+ *           ├── EventDispatcher handles im.message.receive_v1
+ *           └── sendText/sendMedia replies
+ *
+ * Config: ~/.codes/bridge.json
+ * Sessions: ~/.codes/bridge-sessions.json (auto-saved)
  */
 
 import * as Lark from '@larksuiteoapi/node-sdk';
@@ -24,6 +31,7 @@ import * as https from 'node:https';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
 
 // Load .env automatically (so users don't need to export env vars manually).
 // - Does NOT override existing process.env values.
@@ -61,11 +69,6 @@ function loadDotEnvIfPresent() {
 
 // ─── Config ──────────────────────────────────────────────────────
 
-const APP_ID = process.env.FEISHU_APP_ID;
-const APP_SECRET_PATH = resolvePath(process.env.FEISHU_APP_SECRET_PATH || '~/.codes/secrets/feishu_app_secret');
-const CODES_HTTP_PORT = Number(process.env.CODES_HTTP_PORT ?? 3456);
-const THINKING_THRESHOLD_MS = Number(process.env.FEISHU_THINKING_THRESHOLD_MS ?? 2500);
-
 // Local markdown media support (issue #3): allow reading ONLY under these dirs.
 // Default supports the common local automation path: ~/.codes/media
 const ALLOWED_LOCAL_MEDIA_DIRS = (process.env.FEISHU_BRIDGE_ALLOWED_LOCAL_MEDIA_DIRS || '~/.codes/media')
@@ -89,11 +92,8 @@ const INBOUND_FILE_TTL_MIN = Number(process.env.FEISHU_BRIDGE_INBOUND_FILE_TTL_M
 const MAX_ATTACHMENTS = Number(process.env.FEISHU_BRIDGE_MAX_ATTACHMENTS ?? 4);
 
 const SELFTEST = process.argv.includes('--selftest') || process.env.FEISHU_BRIDGE_SELFTEST === '1';
-const DEBUG = process.env.FEISHU_BRIDGE_DEBUG === '1';
+let DEBUG = process.env.FEISHU_BRIDGE_DEBUG === '1';
 const BRIDGE_VERSION = readBridgeVersion();
-const SLASH_CMD_MAX_OUTPUT_CHARS = Number(process.env.FEISHU_BRIDGE_SLASH_MAX_OUTPUT_CHARS ?? 3500);
-
-let CODES_HTTP_TOKEN = process.env.CODES_HTTP_TOKEN || '';
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
@@ -417,307 +417,445 @@ function cleanupTempFile(filePath) {
   }
 }
 
-// ─── Load secrets & config ───────────────────────────────────────
+// ─── ClaudeProcess ────────────────���──────────────────────────────
 
-if (SELFTEST) {
-  await runSelfTest();
-  process.exit(0);
-}
+class ClaudeProcess {
+  /**
+   * @param {{ workDir: string, claudePath?: string, sessionId?: string|null }} opts
+   */
+  constructor({ workDir, claudePath = 'claude', sessionId = null }) {
+    this._workDir = workDir;
+    this._claudePath = claudePath;
+    this._sessionId = sessionId;
+    this._process = null;
+    this._stdin = null;
+    this._costUsd = 0;
+    this._turnCount = 0;
+    this._status = 'idle'; // idle | busy | stopped
+    this._pendingResolve = null;
+    this._pendingReject = null;
+    this._stdoutBuf = '';
+  }
 
-if (!APP_ID) {
-  console.error('[FATAL] FEISHU_APP_ID environment variable is required');
-  process.exit(1);
-}
-
-const APP_SECRET = mustRead(APP_SECRET_PATH, 'Feishu App Secret');
-
-// Load codes HTTP token: env var > ~/.codes/config.json httpTokens[0]
-if (!CODES_HTTP_TOKEN) {
-  try {
-    const cfgPath = resolvePath('~/.codes/config.json');
-    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
-    const tokens = cfg?.httpTokens;
-    if (Array.isArray(tokens) && tokens.length > 0) {
-      CODES_HTTP_TOKEN = String(tokens[0]);
+  _spawn() {
+    const args = [
+      '--output-format', 'stream-json',
+      '--input-format', 'stream-json',
+      '--dangerously-skip-permissions',
+      '--verbose',
+    ];
+    if (this._sessionId) {
+      args.push('--resume', this._sessionId);
     }
-  } catch {
-    // ignore
+
+    const proc = spawn(this._claudePath, args, {
+      cwd: this._workDir,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    this._process = proc;
+    this._stdin = proc.stdin;
+    this._stdoutBuf = '';
+
+    proc.stdout.on('data', (chunk) => this._onStdoutData(chunk));
+    proc.stderr.on('data', (chunk) => {
+      if (DEBUG) console.log(`[claude:stderr] ${chunk.toString().trimEnd()}`);
+    });
+    proc.on('exit', (code, signal) => this._onProcessExit(code, signal));
+    proc.on('error', (err) => {
+      console.error(`[ERROR] claude process error: ${err.message}`);
+      this._onProcessExit(-1, null);
+    });
+
+    this._status = 'idle';
+    if (DEBUG) console.log(`[claude] spawned pid=${proc.pid} cwd=${this._workDir} session=${this._sessionId || '(new)'}`);
+  }
+
+  /**
+   * Send a message to Claude and wait for the result.
+   * Automatically spawns/respawns the subprocess as needed.
+   * @param {string} text
+   * @returns {Promise<{text: string, sessionId: string|null, costUsd: number}>}
+   */
+  async sendMessage(text) {
+    if (this._status === 'stopped') {
+      throw new Error('ClaudeProcess is stopped');
+    }
+    if (this._status === 'busy') {
+      throw new Error('Claude is already processing a message');
+    }
+
+    // Spawn or respawn if process exited
+    if (!this._process || this._process.exitCode !== null) {
+      this._spawn();
+    }
+
+    this._status = 'busy';
+
+    return new Promise((resolve, reject) => {
+      this._pendingResolve = resolve;
+      this._pendingReject = reject;
+
+      const msg = JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: text },
+      }) + '\n';
+
+      try {
+        this._stdin.write(msg);
+      } catch (err) {
+        this._status = 'idle';
+        this._pendingResolve = null;
+        this._pendingReject = null;
+        reject(new Error(`Failed to write to claude stdin: ${err.message}`));
+      }
+    });
+  }
+
+  _onStdoutData(chunk) {
+    this._stdoutBuf += chunk.toString();
+
+    // Guard against unbounded buffer growth (e.g. huge tool_result)
+    if (this._stdoutBuf.length > 64 * 1024 * 1024) {
+      console.error('[ERROR] claude stdout buffer overflow (>64MB), killing process');
+      this._stdoutBuf = '';
+      if (this._process) try { this._process.kill('SIGKILL'); } catch {}
+      return;
+    }
+
+    const lines = this._stdoutBuf.split('\n');
+    this._stdoutBuf = lines.pop() || ''; // keep incomplete last line
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const event = JSON.parse(line);
+
+        // Capture session_id from any event that carries it
+        if (event.session_id) {
+          this._sessionId = event.session_id;
+        }
+
+        if (event.type === 'result') {
+          const resultText = String(event.result || '');
+          if (event.cost_usd != null) this._costUsd += Number(event.cost_usd) || 0;
+          this._turnCount++;
+          this._status = 'idle';
+
+          if (this._pendingResolve) {
+            const resolve = this._pendingResolve;
+            this._pendingResolve = null;
+            this._pendingReject = null;
+            resolve({
+              text: resultText,
+              sessionId: this._sessionId,
+              costUsd: Number(event.cost_usd) || 0,
+            });
+          }
+        }
+      } catch {
+        // Non-JSON line — ignore
+      }
+    }
+  }
+
+  _onProcessExit(code, signal) {
+    const pid = this._process?.pid;
+    if (DEBUG) console.log(`[claude] exited code=${code} signal=${signal} pid=${pid}`);
+
+    this._process = null;
+    this._stdin = null;
+
+    // Flush any remaining buffered output before rejecting
+    if (this._stdoutBuf.trim()) {
+      try {
+        const event = JSON.parse(this._stdoutBuf.trim());
+        if (event.session_id) this._sessionId = event.session_id;
+        if (event.type === 'result') {
+          const resultText = String(event.result || '');
+          if (event.cost_usd != null) this._costUsd += Number(event.cost_usd) || 0;
+          this._turnCount++;
+          if (this._pendingResolve) {
+            const resolve = this._pendingResolve;
+            this._pendingResolve = null;
+            this._pendingReject = null;
+            this._status = 'idle';
+            this._stdoutBuf = '';
+            resolve({ text: resultText, sessionId: this._sessionId, costUsd: Number(event.cost_usd) || 0 });
+            return;
+          }
+        }
+      } catch {
+        // not valid JSON — discard
+      }
+    }
+    this._stdoutBuf = '';
+
+    // If we were waiting for a result, reject the pending promise
+    if (this._status === 'busy' && this._pendingReject) {
+      const reject = this._pendingReject;
+      this._pendingResolve = null;
+      this._pendingReject = null;
+      this._status = 'idle';
+      reject(new Error(`Claude process exited unexpectedly (code=${code}, signal=${signal})`));
+    } else if (this._status !== 'stopped') {
+      this._status = 'idle';
+    }
+  }
+
+  /** Stop the process and mark as stopped (won't accept new messages). */
+  async stop() {
+    this._status = 'stopped';
+
+    if (!this._process) return;
+
+    const proc = this._process;
+    this._process = null;
+    this._stdin = null;
+
+    // Reject pending promise
+    if (this._pendingReject) {
+      const reject = this._pendingReject;
+      this._pendingResolve = null;
+      this._pendingReject = null;
+      reject(new Error('ClaudeProcess stopped'));
+    }
+
+    try { proc.kill('SIGTERM'); } catch {}
+
+    await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        try { proc.kill('SIGKILL'); } catch {}
+        resolve();
+      }, 5000);
+      // Do NOT unref — SIGKILL is critical cleanup
+      proc.on('exit', () => { clearTimeout(timeout); resolve(); });
+    });
+  }
+
+  /** Re-enable after stop (allow new messages). */
+  restart() {
+    this._status = 'idle';
+    this._stdoutBuf = '';
+    this._pendingResolve = null;
+    this._pendingReject = null;
+  }
+
+  info() {
+    return {
+      status: this._status,
+      pid: this._process?.pid || null,
+      sessionId: this._sessionId || null,
+      costUsd: Math.round(this._costUsd * 10000) / 10000,
+      turnCount: this._turnCount,
+    };
   }
 }
 
-if (!CODES_HTTP_TOKEN) {
-  console.error('[FATAL] No codes HTTP token found. Set CODES_HTTP_TOKEN env or add httpTokens to ~/.codes/config.json');
-  process.exit(1);
+// ─── Bridge Config ───────────────────────────────────────────────
+
+function loadBridgeConfig() {
+  const configPath = resolvePath('~/.codes/bridge.json');
+
+  if (!fs.existsSync(configPath)) {
+    console.error(`[FATAL] Bridge config not found: ${configPath}`);
+    console.error('Create ~/.codes/bridge.json with your project configuration.');
+    console.error('See bridge/bridge.example.json for a template.');
+    process.exit(1);
+  }
+
+  let raw;
+  try {
+    raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch (e) {
+    console.error(`[FATAL] Failed to parse ${configPath}: ${e?.message || String(e)}`);
+    process.exit(1);
+  }
+
+  const projects = raw.projects || {};
+  if (Object.keys(projects).length === 0) {
+    console.error('[FATAL] No projects defined in bridge.json');
+    process.exit(1);
+  }
+
+  // Validate each project
+  for (const [alias, proj] of Object.entries(projects)) {
+    if (!proj.path) {
+      console.error(`[FATAL] Project "${alias}" missing "path" in bridge.json`);
+      process.exit(1);
+    }
+    const resolvedPath = resolvePath(proj.path);
+    if (!fs.existsSync(resolvedPath)) {
+      console.error(`[FATAL] Project "${alias}" path not found: ${resolvedPath}`);
+      process.exit(1);
+    }
+    proj.path = resolvedPath;
+
+    if (!proj.feishu?.appId) {
+      console.error(`[FATAL] Project "${alias}" missing "feishu.appId" in bridge.json`);
+      process.exit(1);
+    }
+    if (!proj.feishu?.appSecretPath) {
+      console.error(`[FATAL] Project "${alias}" missing "feishu.appSecretPath" in bridge.json`);
+      process.exit(1);
+    }
+    proj.feishu.appSecretPath = resolvePath(proj.feishu.appSecretPath);
+  }
+
+  return {
+    projects,
+    thinkingThresholdMs: Number(
+      raw.thinkingThresholdMs ?? process.env.FEISHU_THINKING_THRESHOLD_MS ?? 2500,
+    ),
+    claudePath: raw.claudePath || 'claude',
+    debug: raw.debug === true || DEBUG,
+  };
 }
 
-// Health check: verify codes serve is running
-try {
-  const hcResp = await fetch(`http://127.0.0.1:${CODES_HTTP_PORT}/health`);
-  if (!hcResp.ok) throw new Error(`HTTP ${hcResp.status}`);
-  console.log(`[OK] codes serve health check passed (port ${CODES_HTTP_PORT})`);
-} catch (e) {
-  console.error(`[WARN] codes serve health check failed (port ${CODES_HTTP_PORT}): ${e?.message || String(e)}`);
-  console.error('[WARN] Bridge will start anyway — codes serve may come up later');
+// ─── ProjectManager ──────────────────────────────────────────────
+
+const SESSIONS_PATH = resolvePath('~/.codes/bridge-sessions.json');
+
+class ProjectManager {
+  constructor(config) {
+    this._config = config;
+    /** @type {Map<string, {claude: ClaudeProcess, started: boolean, path: string, feishuAppId: string}>} */
+    this._projects = new Map();
+  }
+
+  async init() {
+    const saved = this._loadSessions();
+
+    for (const [alias, proj] of Object.entries(this._config.projects)) {
+      const sessionId = saved[alias]?.sessionId || null;
+      const claude = new ClaudeProcess({
+        workDir: proj.path,
+        claudePath: this._config.claudePath,
+        sessionId,
+      });
+
+      // Restore accumulated stats
+      if (saved[alias]?.costUsd) claude._costUsd = Number(saved[alias].costUsd) || 0;
+      if (saved[alias]?.turnCount) claude._turnCount = Number(saved[alias].turnCount) || 0;
+
+      this._projects.set(alias, {
+        claude,
+        started: true,
+        path: proj.path,
+        feishuAppId: proj.feishu.appId,
+      });
+    }
+
+    // Auto-save sessions every 60s
+    this._saveInterval = setInterval(() => this._saveSessions(), 60_000);
+    if (this._saveInterval.unref) this._saveInterval.unref();
+
+    // Save on process exit, kill all subprocesses
+    const saveAndExit = async () => {
+      this._saveSessions();
+      await this.stopAll();
+      process.exit(0);
+    };
+    process.on('SIGINT', () => saveAndExit());
+    process.on('SIGTERM', () => saveAndExit());
+  }
+
+  getProject(alias) {
+    return this._projects.get(alias) || null;
+  }
+
+  async startProject(alias) {
+    const proj = this._projects.get(alias);
+    if (!proj) return { ok: false, error: `未知项目: ${alias}` };
+    if (proj.started) return { ok: true, message: `${alias} 已在运行中` };
+    proj.claude.restart();
+    proj.started = true;
+    return { ok: true, message: `${alias} 已启动` };
+  }
+
+  async stopProject(alias) {
+    const proj = this._projects.get(alias);
+    if (!proj) return { ok: false, error: `未知项目: ${alias}` };
+    if (!proj.started) return { ok: true, message: `${alias} 已处于停止状态` };
+    await proj.claude.stop();
+    proj.started = false;
+    this._saveSessions();
+    return { ok: true, message: `${alias} 已停止` };
+  }
+
+  async startAll() {
+    const results = [];
+    for (const alias of this._projects.keys()) {
+      results.push({ alias, ...(await this.startProject(alias)) });
+    }
+    return results;
+  }
+
+  async stopAll() {
+    const results = [];
+    for (const alias of this._projects.keys()) {
+      results.push({ alias, ...(await this.stopProject(alias)) });
+    }
+    return results;
+  }
+
+  status() {
+    const out = {};
+    for (const [alias, proj] of this._projects) {
+      const info = proj.claude.info();
+      out[alias] = { started: proj.started, path: proj.path, ...info };
+    }
+    return out;
+  }
+
+  aliases() {
+    return [...this._projects.keys()];
+  }
+
+  _loadSessions() {
+    try {
+      if (fs.existsSync(SESSIONS_PATH)) {
+        return JSON.parse(fs.readFileSync(SESSIONS_PATH, 'utf8'));
+      }
+    } catch {}
+    return {};
+  }
+
+  _saveSessions() {
+    const data = {};
+    for (const [alias, proj] of this._projects) {
+      const info = proj.claude.info();
+      data[alias] = {
+        sessionId: info.sessionId,
+        costUsd: info.costUsd,
+        turnCount: info.turnCount,
+      };
+    }
+    try {
+      fs.mkdirSync(path.dirname(SESSIONS_PATH), { recursive: true });
+      const tmp = SESSIONS_PATH + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+      fs.renameSync(tmp, SESSIONS_PATH);
+    } catch (e) {
+      console.error(`[WARN] Failed to save sessions: ${e?.message || String(e)}`);
+    }
+  }
 }
-
-// ─── Feishu SDK setup ────────────────────────────────────────────
-
-const sdkConfig = {
-  appId: APP_ID,
-  appSecret: APP_SECRET,
-  domain: Lark.Domain.Feishu,
-  appType: Lark.AppType.SelfBuild,
-};
-
-const client = new Lark.Client(sdkConfig);
-const wsClient = new Lark.WSClient({ ...sdkConfig, loggerLevel: Lark.LoggerLevel.info });
 
 // ─── Dedup (Feishu may deliver the same event more than once) ────
 
-const seen = new Map();
+const seenMap = new Map();
 const SEEN_TTL_MS = 10 * 60 * 1000;
 
-function isDuplicate(messageId) {
+function isDuplicate(key) {
   const now = Date.now();
-  for (const [k, ts] of seen) {
-    if (now - ts > SEEN_TTL_MS) seen.delete(k);
+  for (const [k, ts] of seenMap) {
+    if (now - ts > SEEN_TTL_MS) seenMap.delete(k);
   }
-  if (!messageId) return false;
-  if (seen.has(messageId)) return true;
-  seen.set(messageId, now);
+  if (!key) return false;
+  if (seenMap.has(key)) return true;
+  seenMap.set(key, now);
   return false;
-}
-
-// ─── Talk to codes assistant API ─────────────────────────────────
-
-async function askAssistant({ text, sessionKey, attachments = [] }) {
-  // Append attachment descriptions (assistant API currently only accepts text)
-  let fullText = text;
-  if (attachments.length > 0) {
-    const descs = attachments.map((a) => a.fileName || a.type || 'attachment');
-    fullText += '\n[附件: ' + descs.join(', ') + ']';
-  }
-
-  const resp = await fetch(`http://127.0.0.1:${CODES_HTTP_PORT}/assistant`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${CODES_HTTP_TOKEN}`,
-    },
-    body: JSON.stringify({
-      text: fullText,
-      session_id: sessionKey,
-    }),
-  });
-
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}));
-    throw new Error(`Assistant API error ${resp.status}: ${err.error || resp.statusText}`);
-  }
-
-  const result = await resp.json();
-  return { text: result.reply || '', mediaUrls: [] };
-}
-
-// ─── Slash command mode (/health, /get /projects, ...) ───────────
-
-const HTTP_METHODS = new Set(['GET', 'POST', 'PATCH', 'DELETE']);
-
-const ENDPOINT_RULES = [
-  { pathRe: /^\/health$/, methods: ['GET'] },
-  { pathRe: /^\/assistant$/, methods: ['POST'] },
-  { pathRe: /^\/projects(?:\/[^/?#]+)?$/, methods: ['GET'] },
-  { pathRe: /^\/profiles$/, methods: ['GET'] },
-  { pathRe: /^\/profiles\/switch$/, methods: ['POST'] },
-  { pathRe: /^\/sessions$/, methods: ['GET', 'POST'] },
-  { pathRe: /^\/sessions\/[^/?#]+$/, methods: ['GET', 'DELETE'] },
-  { pathRe: /^\/sessions\/[^/?#]+\/ws$/, methods: ['GET'] },
-  { pathRe: /^\/sessions\/[^/?#]+\/(?:interrupt|resume|message)$/, methods: ['POST'] },
-  { pathRe: /^\/teams$/, methods: ['GET', 'POST'] },
-  { pathRe: /^\/teams\/[^/?#]+$/, methods: ['GET', 'DELETE'] },
-  { pathRe: /^\/teams\/[^/?#]+\/tasks$/, methods: ['GET', 'POST'] },
-  { pathRe: /^\/teams\/[^/?#]+\/tasks\/[^/?#]+$/, methods: ['PATCH'] },
-  { pathRe: /^\/teams\/[^/?#]+\/messages$/, methods: ['GET', 'POST'] },
-  { pathRe: /^\/teams\/[^/?#]+\/(?:start|stop)$/, methods: ['POST'] },
-  { pathRe: /^\/teams\/[^/?#]+\/activity$/, methods: ['GET'] },
-  { pathRe: /^\/tasks\/[^/?#]+\/[^/?#]+$/, methods: ['GET'] },
-  { pathRe: /^\/stats\/(?:summary|projects|models)$/, methods: ['GET'] },
-  { pathRe: /^\/stats\/refresh$/, methods: ['POST'] },
-  { pathRe: /^\/workflows$/, methods: ['GET'] },
-  { pathRe: /^\/workflows\/[^/?#]+$/, methods: ['GET'] },
-  { pathRe: /^\/workflows\/[^/?#]+\/run$/, methods: ['POST'] },
-];
-
-function buildSlashCommandHelp() {
-  return [
-    '命令模式（直连 codes server 端点）',
-    '',
-    '用法:',
-    '1) 直接 GET: /health 或 /projects',
-    '2) 显式方法: /get /stats/summary?period=week',
-    '3) 带 JSON body: /post /teams {"name":"ofb","workDir":"/home/bigb/projects/openclaw_for_business"}',
-    '4) 多行 body:',
-    '   /patch /teams/ofb/tasks/1',
-    '   {"action":"cancel"}',
-    '',
-    '支持方法: GET, POST, PATCH, DELETE',
-    '查看帮助: /help',
-  ].join('\n');
-}
-
-function parseSlashCommand(text) {
-  const raw = String(text ?? '').trim();
-  if (!raw.startsWith('/')) {
-    return { ok: false, error: 'not a slash command' };
-  }
-
-  const lines = raw.split(/\r?\n/);
-  const firstLine = lines[0].trim();
-  const restBody = lines.slice(1).join('\n').trim();
-  if (!firstLine) {
-    return { ok: false, error: 'empty command' };
-  }
-
-  const parts = firstLine.split(/\s+/).filter(Boolean);
-  if (parts.length === 0) {
-    return { ok: false, error: 'empty command' };
-  }
-
-  const first = parts[0].toLowerCase();
-  if (first === '/help' || first === '/?') {
-    return { ok: true, help: true };
-  }
-
-  let method = 'GET';
-  let target = '';
-  let inlineBody = '';
-
-  if (/^\/(get|post|patch|delete)$/i.test(first)) {
-    method = first.slice(1).toUpperCase();
-    if (parts.length < 2) {
-      return { ok: false, error: 'missing endpoint path' };
-    }
-    target = parts[1];
-    const head = `${parts[0]} ${parts[1]}`;
-    inlineBody = firstLine.startsWith(head) ? firstLine.slice(head.length).trim() : '';
-  } else {
-    target = parts[0];
-    if (parts.length > 1) {
-      return { ok: false, error: 'unexpected extra arguments; use /get /path?x=1 style' };
-    }
-  }
-
-  if (!target.startsWith('/') || target.startsWith('//')) {
-    return { ok: false, error: 'endpoint must start with a single /' };
-  }
-
-  const bodyRaw = restBody || inlineBody;
-  if (bodyRaw && !['POST', 'PATCH'].includes(method)) {
-    return { ok: false, error: `${method} does not accept request body in command mode` };
-  }
-
-  let body = null;
-  if (bodyRaw) {
-    try {
-      body = JSON.parse(bodyRaw);
-    } catch (e) {
-      return { ok: false, error: `invalid JSON body: ${e?.message || String(e)}` };
-    }
-  }
-
-  return { ok: true, help: false, method, target, body };
-}
-
-function findEndpointRule(pathname) {
-  return ENDPOINT_RULES.find((r) => r.pathRe.test(pathname)) || null;
-}
-
-function extractErrorMessage(obj) {
-  if (!obj || typeof obj !== 'object') return '';
-  if (typeof obj.error === 'string' && obj.error) return obj.error;
-  if (typeof obj.message === 'string' && obj.message) return obj.message;
-  return '';
-}
-
-async function callCodesEndpointByCommand(rawText) {
-  const parsed = parseSlashCommand(rawText);
-  if (!parsed.ok) {
-    return { text: `命令格式错误: ${parsed.error}\n\n${buildSlashCommandHelp()}`, mediaUrls: [] };
-  }
-  if (parsed.help) {
-    return { text: buildSlashCommandHelp(), mediaUrls: [] };
-  }
-
-  if (!HTTP_METHODS.has(parsed.method)) {
-    return { text: `不支持的方法: ${parsed.method}`, mediaUrls: [] };
-  }
-
-  const base = `http://127.0.0.1:${CODES_HTTP_PORT}`;
-  let url;
-  try {
-    url = new URL(parsed.target, base);
-  } catch (e) {
-    return { text: `路径解析失败: ${e?.message || String(e)}`, mediaUrls: [] };
-  }
-
-  if (url.origin !== base) {
-    return { text: '只允许访问本机 codes server', mediaUrls: [] };
-  }
-
-  const rule = findEndpointRule(url.pathname);
-  if (!rule) {
-    return { text: `端点不在允许列表中: ${url.pathname}\n\n${buildSlashCommandHelp()}`, mediaUrls: [] };
-  }
-  if (!rule.methods.includes(parsed.method)) {
-    return {
-      text: `方法不匹配: ${parsed.method} ${url.pathname}\n允许方法: ${rule.methods.join(', ')}`,
-      mediaUrls: [],
-    };
-  }
-
-  const headers = {
-    Accept: 'application/json',
-    Authorization: `Bearer ${CODES_HTTP_TOKEN}`,
-  };
-  const req = { method: parsed.method, headers };
-  if (parsed.body != null) {
-    req.body = JSON.stringify(parsed.body);
-    req.headers['Content-Type'] = 'application/json';
-  }
-
-  let resp;
-  try {
-    resp = await fetch(url, req);
-  } catch (e) {
-    return { text: `请求失败: ${e?.message || String(e)}`, mediaUrls: [] };
-  }
-
-  const contentType = String(resp.headers.get('content-type') || '').toLowerCase();
-  let payloadText = '';
-  let payloadJSON = null;
-
-  if (contentType.includes('application/json')) {
-    payloadJSON = await resp.json().catch(() => null);
-    if (payloadJSON != null) {
-      payloadText = JSON.stringify(payloadJSON, null, 2);
-    }
-  }
-  if (!payloadText) {
-    payloadText = await resp.text().catch(() => '');
-  }
-  payloadText = truncate(payloadText || '', SLASH_CMD_MAX_OUTPUT_CHARS);
-
-  const statusPrefix = resp.ok ? '[OK]' : '[ERR]';
-  const head = `${statusPrefix} ${parsed.method} ${url.pathname}${url.search} -> ${resp.status} ${resp.statusText}`;
-  const errMsg = !resp.ok ? extractErrorMessage(payloadJSON) : '';
-
-  if (errMsg && !payloadText) {
-    payloadText = errMsg;
-  }
-  if (!payloadText) {
-    return { text: head, mediaUrls: [] };
-  }
-  return { text: `${head}\n\n${payloadText}`, mediaUrls: [] };
 }
 
 // ─── Feishu message parsing ─────────────────────────────────────
@@ -763,8 +901,7 @@ function extractFromPostJson(postJson) {
       if (tag === 'code_block') {
         const lang = String(node.language || '').trim();
         const code = String(node.text || '');
-        return `\n\n\
-\`\`\`${lang ? ` ${lang}` : ''}\n${code}\n\`\`\`\n\n`;
+        return `\n\n\`\`\`${lang ? ` ${lang}` : ''}\n${code}\n\`\`\`\n\n`;
       }
     }
 
@@ -801,8 +938,7 @@ function extractFromPostJson(postJson) {
   return { text, imageKeys: [...new Set(imageKeys)] };
 }
 
-
-async function downloadFeishuImageAsDataUrl(messageId, imageKey) {
+async function downloadFeishuImageAsDataUrl(client, messageId, imageKey) {
   const tmp = path.join(os.tmpdir(), `feishu_recv_${Date.now()}_${Math.random().toString(16).slice(2)}.png`);
   try {
     if (DEBUG) console.log(`[DEBUG] Downloading image: messageId=${messageId}, imageKey=${imageKey}`);
@@ -866,7 +1002,7 @@ async function downloadFeishuImageAsDataUrl(messageId, imageKey) {
   }
 }
 
-async function downloadFeishuFileToPath(messageId, fileKey, fileName = 'file.bin', type = 'file') {
+async function downloadFeishuFileToPath(client, messageId, fileKey, fileName = 'file.bin', type = 'file') {
   const ext = path.extname(fileName || '') || '.bin';
   const tmp = path.join(
     os.tmpdir(),
@@ -921,7 +1057,7 @@ async function downloadFeishuFileToPath(messageId, fileKey, fileName = 'file.bin
   return tmp;
 }
 
-async function buildInboundFromFeishuMessage(message) {
+async function buildInboundFromFeishuMessage(client, message) {
   const messageId = message?.message_id;
   const messageType = message?.message_type;
   const rawContent = message?.content;
@@ -957,7 +1093,7 @@ async function buildInboundFromFeishuMessage(message) {
       if (messageId && imageKeys.length > 0) {
         for (const k of imageKeys.slice(0, MAX_ATTACHMENTS)) {
           try {
-            const dataUrl = await downloadFeishuImageAsDataUrl(messageId, k);
+            const dataUrl = await downloadFeishuImageAsDataUrl(client, messageId, k);
             out.attachments.push({ type: 'image', content: dataUrl, mimeType: 'image/png', fileName: 'feishu.png' });
           } catch (e) {
             // keep going
@@ -977,7 +1113,7 @@ async function buildInboundFromFeishuMessage(message) {
       const parsed = JSON.parse(rawContent);
       const imageKey = parsed?.image_key;
       if (imageKey && messageId) {
-        const dataUrl = await downloadFeishuImageAsDataUrl(messageId, imageKey);
+        const dataUrl = await downloadFeishuImageAsDataUrl(client, messageId, imageKey);
         out.attachments.push({ type: 'image', content: dataUrl, mimeType: 'image/png', fileName: 'feishu.png' });
         out.text = '[图片]';
       }
@@ -1002,7 +1138,7 @@ async function buildInboundFromFeishuMessage(message) {
       // Best-effort: thumbnail
       if (thumbKey && messageId) {
         try {
-          const thumbUrl = await downloadFeishuImageAsDataUrl(messageId, thumbKey);
+          const thumbUrl = await downloadFeishuImageAsDataUrl(client, messageId, thumbKey);
           out.attachments.push({ type: 'image', content: thumbUrl, mimeType: 'image/png', fileName: 'feishu-thumb.png' });
         } catch (e) {
           console.error(`[WARN] media thumbnail download failed: messageId=${messageId} imageKey=${thumbKey} err=${e?.message || String(e)}`);
@@ -1012,9 +1148,7 @@ async function buildInboundFromFeishuMessage(message) {
       // Best-effort: download the video file so the agent can access it.
       if (fileKey && messageId) {
         try {
-          const fp = await downloadFeishuFileToPath(messageId, fileKey, fileName, 'file');
-          // NOTE: assistant API currently only accepts text input.
-          // For videos, pass the local path via text so the assistant can decide how to use it.
+          const fp = await downloadFeishuFileToPath(client, messageId, fileKey, fileName, 'file');
           out.text += `\n\n[附件路径] file://${fp}`;
         } catch (e) {
           console.error(`[WARN] media download failed: messageId=${messageId} fileKey=${fileKey} err=${e?.message || String(e)}`);
@@ -1036,9 +1170,7 @@ async function buildInboundFromFeishuMessage(message) {
 
       if (fileKey && messageId) {
         try {
-          const fp = await downloadFeishuFileToPath(messageId, fileKey, fileName, 'file');
-          // NOTE: assistant API currently only accepts text input.
-          // For files, pass the local path via text so the assistant can decide how to use it.
+          const fp = await downloadFeishuFileToPath(client, messageId, fileKey, fileName, 'file');
           out.text += `\n\n[附件路径] file://${fp}`;
         } catch (e) {
           console.error(`[WARN] file download failed: messageId=${messageId} fileKey=${fileKey} err=${e?.message || String(e)}`);
@@ -1060,9 +1192,7 @@ async function buildInboundFromFeishuMessage(message) {
 
       if (fileKey && messageId) {
         try {
-          const fp = await downloadFeishuFileToPath(messageId, fileKey, fileName, 'file');
-          // NOTE: assistant API currently only accepts text input.
-          // For audio, pass the local path via text so the assistant can decide how to use it.
+          const fp = await downloadFeishuFileToPath(client, messageId, fileKey, fileName, 'file');
           out.text += `\n\n[附件路径] file://${fp}`;
         } catch (e) {
           console.error(`[WARN] audio download failed: messageId=${messageId} fileKey=${fileKey} err=${e?.message || String(e)}`);
@@ -1106,25 +1236,25 @@ async function buildInboundFromFeishuMessage(message) {
 
 // ─── Feishu sending (text + media) ──────────────────────────────
 
-async function sendText(chatId, text) {
+async function sendText(client, chatId, text) {
   return client.im.v1.message.create({
     params: { receive_id_type: 'chat_id' },
     data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text }) },
   });
 }
 
-async function updateTextMessage(messageId, text) {
+async function updateTextMessage(client, messageId, text) {
   return client.im.v1.message.update({
     path: { message_id: messageId },
     data: { msg_type: 'text', content: JSON.stringify({ text }) },
   });
 }
 
-async function deleteMessage(messageId) {
+async function deleteMessage(client, messageId) {
   return client.im.v1.message.delete({ path: { message_id: messageId } });
 }
 
-async function uploadAndSendMedia(chatId, mediaUrlOrPath, captionText) {
+async function uploadAndSendMedia(client, chatId, mediaUrlOrPath, captionText) {
   let tempPath = null;
   let localPath = null;
 
@@ -1145,7 +1275,7 @@ async function uploadAndSendMedia(chatId, mediaUrlOrPath, captionText) {
       // data:<mime>;base64,<payload>
       const m = raw.match(/^data:([^;]+);base64,(.*)$/);
       if (!m) {
-        await sendText(chatId, captionText ? `${captionText}\n${raw}` : raw);
+        await sendText(client, chatId, captionText ? `${captionText}\n${raw}` : raw);
         return;
       }
       const mime = m[1];
@@ -1162,7 +1292,7 @@ async function uploadAndSendMedia(chatId, mediaUrlOrPath, captionText) {
       localPath = tempPath;
     } else {
       // Unknown scheme; just send as text.
-      await sendText(chatId, captionText ? `${captionText}\n${raw}` : raw);
+      await sendText(client, chatId, captionText ? `${captionText}\n${raw}` : raw);
       return;
     }
 
@@ -1176,14 +1306,14 @@ async function uploadAndSendMedia(chatId, mediaUrlOrPath, captionText) {
         if (DEBUG) console.log(`[DEBUG] outbound blocked by allowlist: ${p}`);
         // Don't spam users in normal mode; just skip this media.
         if (DEBUG) {
-          await sendText(chatId, captionText ? `${captionText}\n（拒绝发送非白名单路径的本地文件）` : '（拒绝发送非白名单路径的本地文件）');
+          await sendText(client, chatId, captionText ? `${captionText}\n（拒绝发送非白名单路径的本地文件）` : '（拒绝发送非白名单路径的本地文件）');
         }
         return;
       }
       const ok = safeFileSizeOk(p);
       if (!ok.ok) {
         if (DEBUG) {
-          await sendText(chatId, captionText ? `${captionText}\n（附件过大或不可读：${ok.reason}）` : `（附件过大或不可读：${ok.reason}）`);
+          await sendText(client, chatId, captionText ? `${captionText}\n（附件过大或不可读：${ok.reason}）` : `（附件过大或不可读：${ok.reason}）`);
         }
         return;
       }
@@ -1202,7 +1332,7 @@ async function uploadAndSendMedia(chatId, mediaUrlOrPath, captionText) {
         data: { receive_id: chatId, msg_type: 'image', content: JSON.stringify({ image_key: imageKey }) },
       });
 
-      if (captionText?.trim()) await sendText(chatId, captionText.trim());
+      if (captionText?.trim()) await sendText(client, chatId, captionText.trim());
       return;
     }
 
@@ -1219,7 +1349,7 @@ async function uploadAndSendMedia(chatId, mediaUrlOrPath, captionText) {
         data: { receive_id: chatId, msg_type: 'media', content: JSON.stringify({ file_key: fileKey }) },
       });
 
-      if (captionText?.trim()) await sendText(chatId, captionText.trim());
+      if (captionText?.trim()) await sendText(client, chatId, captionText.trim());
       return;
     }
 
@@ -1236,7 +1366,7 @@ async function uploadAndSendMedia(chatId, mediaUrlOrPath, captionText) {
         data: { receive_id: chatId, msg_type: 'audio', content: JSON.stringify({ file_key: fileKey }) },
       });
 
-      if (captionText?.trim()) await sendText(chatId, captionText.trim());
+      if (captionText?.trim()) await sendText(client, chatId, captionText.trim());
       return;
     }
 
@@ -1252,29 +1382,91 @@ async function uploadAndSendMedia(chatId, mediaUrlOrPath, captionText) {
       data: { receive_id: chatId, msg_type: 'file', content: JSON.stringify({ file_key: fileKey }) },
     });
 
-    if (captionText?.trim()) await sendText(chatId, captionText.trim());
+    if (captionText?.trim()) await sendText(client, chatId, captionText.trim());
   } finally {
     if (tempPath) cleanupTempFile(tempPath);
   }
 }
 
-// ─── Message handler ─────────────────────────────────────────────
+// ─── Slash commands ──────────────────────────────────────────────
 
-const dispatcher = new Lark.EventDispatcher({}).register({
-  'im.message.receive_v1': async (data) => {
+async function handleSlashCommand(pm, alias, text) {
+  const raw = String(text || '').trim();
+  const parts = raw.split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+  const arg = parts[1] || '';
+
+  if (cmd === '/help' || cmd === '/?') {
+    return {
+      text: [
+        'Bridge 命令:',
+        '',
+        '/start [alias|all]  — 启动项目的 Claude Code',
+        '/stop [alias|all]   — 停止项目的 Claude Code',
+        '/status             — 查看所有项目状态',
+        '/help               — 显示此帮助',
+        '',
+        `当前项目: ${alias}`,
+        `所有项目: ${pm.aliases().join(', ')}`,
+      ].join('\n'),
+    };
+  }
+
+  if (cmd === '/status') {
+    const st = pm.status();
+    const lines = ['项目状态:'];
+    for (const [a, info] of Object.entries(st)) {
+      const flag = info.started ? '🟢' : '🔴';
+      const pid = info.pid ? `PID=${info.pid}` : '';
+      const cost = info.costUsd > 0 ? `$${info.costUsd}` : '';
+      const turns = info.turnCount > 0 ? `${info.turnCount}轮` : '';
+      const session = info.sessionId ? `session=${info.sessionId.slice(0, 8)}…` : '';
+      const details = [pid, cost, turns, session].filter(Boolean).join(' ');
+      lines.push(`${flag} ${a} (${info.path})${details ? ' — ' + details : ''}`);
+    }
+    return { text: lines.join('\n') };
+  }
+
+  if (cmd === '/start') {
+    if (arg.toLowerCase() === 'all') {
+      await pm.startAll();
+      return { text: '所有项目已启动' };
+    }
+    const target = arg || alias;
+    const r = await pm.startProject(target);
+    return { text: r.ok ? r.message : `错误: ${r.error}` };
+  }
+
+  if (cmd === '/stop') {
+    if (arg.toLowerCase() === 'all') {
+      await pm.stopAll();
+      return { text: '所有项目已停止' };
+    }
+    const target = arg || alias;
+    const r = await pm.stopProject(target);
+    return { text: r.ok ? r.message : `错误: ${r.error}` };
+  }
+
+  return { text: `未知命令: ${cmd}\n输入 /help 查看帮助` };
+}
+
+// ─── Message handler factory ─────────────────────────────────────
+
+function createMessageHandler(pm, alias, larkClient, thresholdMs) {
+  return async (data) => {
     try {
       const { message, sender } = data || {};
       const chatId = message?.chat_id;
       const messageId = message?.message_id;
       const chatType = message?.chat_type;
-      const senderId = sender?.sender_id?.open_id || '';
 
       if (!chatId || !messageId) return;
-      if (isDuplicate(messageId)) return;
+      // Include alias in dedup key so multiple bots can process the same message independently
+      if (isDuplicate(`${alias}:${messageId}`)) return;
       if (!message?.content) return;
 
-      const inbound = await buildInboundFromFeishuMessage(message);
-      let text = inbound.text;
+      const inbound = await buildInboundFromFeishuMessage(larkClient, message);
+      let text = (inbound.text || '').trim();
       const attachments = inbound.attachments;
 
       // Group chat: respond only when needed.
@@ -1298,42 +1490,52 @@ const dispatcher = new Lark.EventDispatcher({}).register({
         text = cleaned;
       }
 
-      // Better session key isolation: p2p by sender, group by chat.
-      const sessionKey = `feishu:${chatType === 'p2p' ? senderId : chatId}`;
-
       // Process asynchronously
       setImmediate(async () => {
         let placeholderId = '';
         let done = false;
 
         const timer =
-          THINKING_THRESHOLD_MS > 0
+          thresholdMs > 0
             ? setTimeout(async () => {
                 if (done) return;
                 try {
-                  const res = await sendText(chatId, '正在思考…');
+                  const res = await sendText(larkClient, chatId, '正在思考…');
                   placeholderId = res?.data?.message_id || '';
                 } catch {
                   // ignore
                 }
-              }, THINKING_THRESHOLD_MS)
+              }, thresholdMs)
             : null;
 
         let replyText = '';
         let mediaUrls = [];
         try {
-          const slashCommandMode = String(text || '').trim().startsWith('/') && attachments.length === 0;
-          const r = slashCommandMode
-            ? await callCodesEndpointByCommand(text)
-            : await askAssistant({ text, sessionKey, attachments });
-          if (typeof r === 'string') {
-            replyText = r;
-          } else {
+          const trimmed = String(text || '').trim();
+          const isSlash = trimmed.startsWith('/') && attachments.length === 0;
+
+          if (isSlash) {
+            const r = await handleSlashCommand(pm, alias, trimmed);
             replyText = String(r?.text ?? '');
-            if (Array.isArray(r?.mediaUrls)) {
-              mediaUrls = r.mediaUrls
-                .filter((u) => typeof u === 'string' && u.trim())
-                .map((u) => u.trim());
+          } else {
+            const proj = pm.getProject(alias);
+            if (!proj || !proj.started) {
+              replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
+            } else {
+              // Build full text with attachment data
+              let fullText = text;
+              for (const att of attachments) {
+                if (att.type === 'image' && att.content?.startsWith('data:')) {
+                  fullText += `\n[图片(base64 data URL): ${att.fileName || 'image'}]`;
+                } else if (att.content?.startsWith('/') || att.content?.startsWith('file://')) {
+                  fullText += `\n[附件路径] ${att.content}`;
+                } else {
+                  fullText += `\n[附件: ${att.fileName || att.type || 'attachment'}]`;
+                }
+              }
+
+              const result = await proj.claude.sendMessage(fullText);
+              replyText = String(result?.text ?? '');
             }
           }
         } catch (e) {
@@ -1344,9 +1546,8 @@ const dispatcher = new Lark.EventDispatcher({}).register({
         }
 
         // Support agent-produced media outputs
-        // 1) structured mediaUrls from the assistant response
-        // 2) explicit MEDIA: lines in text
-        // 3) markdown local image refs like ![](/tmp/x.png)
+        // 1) explicit MEDIA: lines in text
+        // 2) markdown local image refs like ![](/tmp/x.png)
         const parsed = parseMediaLines(replyText);
         replyText = parsed.text;
         mediaUrls = mediaUrls.concat(parsed.mediaUrls || []);
@@ -1366,7 +1567,7 @@ const dispatcher = new Lark.EventDispatcher({}).register({
         if ((!trimmedText || trimmedText === 'NO_REPLY' || trimmedText.endsWith('NO_REPLY')) && mediaUrls.length === 0) {
           if (placeholderId) {
             try {
-              await deleteMessage(placeholderId);
+              await deleteMessage(larkClient, placeholderId);
             } catch {}
           }
           return;
@@ -1380,54 +1581,48 @@ const dispatcher = new Lark.EventDispatcher({}).register({
           if (mediaUrls.length > 0) {
             if (placeholderId) {
               try {
-                await deleteMessage(placeholderId);
+                await deleteMessage(larkClient, placeholderId);
               } catch {}
               placeholderId = '';
             }
 
             // Send each media (best-effort), then remaining text.
             for (const u of mediaUrls.slice(0, 4)) {
-              await uploadAndSendMedia(chatId, u, undefined);
+              await uploadAndSendMedia(larkClient, chatId, u, undefined);
             }
             if (replyText?.trim()) {
-              await sendText(chatId, replyText.trim());
+              await sendText(larkClient, chatId, replyText.trim());
             }
             return;
           }
 
           if (placeholderId) {
             try {
-              await updateTextMessage(placeholderId, replyText);
+              await updateTextMessage(larkClient, placeholderId, replyText);
               return;
             } catch {
               // fall through
             }
           }
 
-          await sendText(chatId, replyText);
+          await sendText(larkClient, chatId, replyText);
         } catch (err) {
           // Last resort: try to clean placeholder and send an error message.
           if (placeholderId) {
             try {
-              await deleteMessage(placeholderId);
+              await deleteMessage(larkClient, placeholderId);
             } catch {}
           }
           try {
-            await sendText(chatId, `（发送失败）${err instanceof Error ? err.message : String(err)}`);
+            await sendText(larkClient, chatId, `（发送失败）${err instanceof Error ? err.message : String(err)}`);
           } catch {}
         }
       });
     } catch (e) {
       console.error('[ERROR] message handler:', e);
     }
-  },
-});
-
-// ─── Start ───────────────────────────────────────────────────────
-
-wsClient.start({ eventDispatcher: dispatcher });
-console.log(`[OK] Feishu bridge started (appId=${APP_ID}, codes port=${CODES_HTTP_PORT})`);
-console.log(`[OK] Allowed local media dirs: ${ALLOWED_LOCAL_MEDIA_DIRS.join(', ') || '(none)'}`);
+  };
+}
 
 // ─── Self-test ───────────────────────────────────────────────────
 
@@ -1464,22 +1659,65 @@ async function runSelfTest() {
   const r = parseMediaLines('hello\nMEDIA: /tmp/a.mp4\nworld');
   ok('MEDIA parsed', r.mediaUrls.length === 1 && r.text.includes('hello') && r.text.includes('world'));
 
-  // 4) slash command parsing
-  const c1 = parseSlashCommand('/health');
-  ok('slash parse /health', c1.ok && c1.method === 'GET' && c1.target === '/health');
-  const c2 = parseSlashCommand('/post /teams {"name":"x"}');
-  ok('slash parse inline json', c2.ok && c2.method === 'POST' && c2.body?.name === 'x');
-  const c3 = parseSlashCommand('/patch /teams/ofb/tasks/1\n{"action":"cancel"}');
-  ok('slash parse multiline json', c3.ok && c3.method === 'PATCH' && c3.body?.action === 'cancel');
+  // 4) ClaudeProcess construction
+  const cp = new ClaudeProcess({ workDir: '/tmp', claudePath: 'echo', sessionId: 'test-123' });
+  const info = cp.info();
+  ok('ClaudeProcess info', info.status === 'idle' && info.sessionId === 'test-123' && info.turnCount === 0);
 
-  // 5) codes assistant health check
-  try {
-    const port = Number(process.env.CODES_HTTP_PORT ?? 3456);
-    const hc = await fetch(`http://127.0.0.1:${port}/health`);
-    ok('codes health check', hc.ok);
-  } catch (e) {
-    console.log(`[SKIP] codes serve not running (${e?.message || String(e)})`);
+  // 5) bridge config file check
+  const cfgPath = resolvePath('~/.codes/bridge.json');
+  if (fs.existsSync(cfgPath)) {
+    try {
+      const cfg = loadBridgeConfig();
+      ok('bridge.json valid', Object.keys(cfg.projects).length > 0);
+    } catch (e) {
+      console.log(`[SKIP] bridge.json validation failed: ${e?.message || String(e)}`);
+    }
+  } else {
+    console.log('[SKIP] ~/.codes/bridge.json not found');
   }
 
   console.log('[OK] Selftests finished');
 }
+
+// ─── Start ───────────────────────────────────────────────────────
+
+if (SELFTEST) {
+  await runSelfTest();
+  process.exit(0);
+}
+
+const bridgeConfig = loadBridgeConfig();
+if (bridgeConfig.debug) DEBUG = true;
+
+const pm = new ProjectManager(bridgeConfig);
+await pm.init();
+
+// Start one Feishu bot per project
+for (const [alias, proj] of Object.entries(bridgeConfig.projects)) {
+  const secret = mustRead(proj.feishu.appSecretPath, `Feishu secret for "${alias}"`);
+  const sdkConfig = {
+    appId: proj.feishu.appId,
+    appSecret: secret,
+    domain: Lark.Domain.Feishu,
+    appType: Lark.AppType.SelfBuild,
+  };
+
+  const larkClient = new Lark.Client(sdkConfig);
+  const wsClient = new Lark.WSClient({ ...sdkConfig, loggerLevel: Lark.LoggerLevel.info });
+
+  const dispatcher = new Lark.EventDispatcher({}).register({
+    'im.message.receive_v1': createMessageHandler(
+      pm,
+      alias,
+      larkClient,
+      bridgeConfig.thinkingThresholdMs,
+    ),
+  });
+
+  wsClient.start({ eventDispatcher: dispatcher });
+  console.log(`[OK] Bot started: "${alias}" (appId=${proj.feishu.appId}, path=${proj.path})`);
+}
+
+console.log(`[OK] Feishu bridge v${BRIDGE_VERSION} started — ${Object.keys(bridgeConfig.projects).length} project(s)`);
+console.log(`[OK] Allowed local media dirs: ${ALLOWED_LOCAL_MEDIA_DIRS.join(', ') || '(none)'}`);

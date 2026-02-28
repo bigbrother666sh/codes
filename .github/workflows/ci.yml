@@ -7,51 +7,28 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+  check:
+    runs-on: ubuntu-latest
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Setup Go
-      uses: actions/setup-go@v5
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
       with:
-        go-version: '1.24.x'
-        cache: true
+        node-version: '22'
+        cache: 'npm'
+        cache-dependency-path: bridge/package-lock.json
 
     - name: Install dependencies
-      run: go mod download
+      working-directory: bridge
+      run: npm ci
 
-    - name: Vet
-      run: go vet ./...
+    - name: Syntax check
+      working-directory: bridge
+      run: node --check bridge.mjs
 
-    - name: Unit tests
-      run: go test ./... -v -count=1
-
-    - name: Build (Unix)
-      if: runner.os != 'Windows'
-      run: go build -o codes ./cmd/codes
-
-    - name: Build (Windows)
-      if: runner.os == 'Windows'
-      run: go build -o codes.exe ./cmd/codes
-
-    - name: Smoke test (Unix)
-      if: runner.os != 'Windows'
-      run: |
-        ./codes version
-        ./codes --help
-        ./codes profile add --help
-        ./codes config list terminal
-
-    - name: Smoke test (Windows)
-      if: runner.os == 'Windows'
-      run: |
-        .\codes.exe version
-        .\codes.exe --help
-        .\codes.exe profile add --help
-        .\codes.exe config list terminal
+    - name: Self-test
+      working-directory: bridge
+      run: node bridge.mjs --selftest

@@ -1,15 +1,8 @@
-**/config.json
-config.json
-
-docs/
-
-# Binary
-/codes
-/codes.exe
-.serena/
-
-# Bridge
+node_modules/
 bridge/node_modules/
 bridge/.env
+bridge/bridge.json
 
 .DS_Store
+*.log
+.serena/
