@@ -91,6 +91,7 @@ const MAX_ATTACHMENTS = Number(process.env.FEISHU_BRIDGE_MAX_ATTACHMENTS ?? 4);
 const SELFTEST = process.argv.includes('--selftest') || process.env.FEISHU_BRIDGE_SELFTEST === '1';
 const DEBUG = process.env.FEISHU_BRIDGE_DEBUG === '1';
 const BRIDGE_VERSION = readBridgeVersion();
+const SLASH_CMD_MAX_OUTPUT_CHARS = Number(process.env.FEISHU_BRIDGE_SLASH_MAX_OUTPUT_CHARS ?? 3500);
 
 let CODES_HTTP_TOKEN = process.env.CODES_HTTP_TOKEN || '';
 
@@ -516,6 +517,207 @@ async function askAssistant({ text, sessionKey, attachments = [] }) {
 
   const result = await resp.json();
   return { text: result.reply || '', mediaUrls: [] };
+}
+
+// ─── Slash command mode (/health, /get /projects, ...) ───────────
+
+const HTTP_METHODS = new Set(['GET', 'POST', 'PATCH', 'DELETE']);
+
+const ENDPOINT_RULES = [
+  { pathRe: /^\/health$/, methods: ['GET'] },
+  { pathRe: /^\/assistant$/, methods: ['POST'] },
+  { pathRe: /^\/projects(?:\/[^/?#]+)?$/, methods: ['GET'] },
+  { pathRe: /^\/profiles$/, methods: ['GET'] },
+  { pathRe: /^\/profiles\/switch$/, methods: ['POST'] },
+  { pathRe: /^\/sessions$/, methods: ['GET', 'POST'] },
+  { pathRe: /^\/sessions\/[^/?#]+$/, methods: ['GET', 'DELETE'] },
+  { pathRe: /^\/sessions\/[^/?#]+\/ws$/, methods: ['GET'] },
+  { pathRe: /^\/sessions\/[^/?#]+\/(?:interrupt|resume|message)$/, methods: ['POST'] },
+  { pathRe: /^\/teams$/, methods: ['GET', 'POST'] },
+  { pathRe: /^\/teams\/[^/?#]+$/, methods: ['GET', 'DELETE'] },
+  { pathRe: /^\/teams\/[^/?#]+\/tasks$/, methods: ['GET', 'POST'] },
+  { pathRe: /^\/teams\/[^/?#]+\/tasks\/[^/?#]+$/, methods: ['PATCH'] },
+  { pathRe: /^\/teams\/[^/?#]+\/messages$/, methods: ['GET', 'POST'] },
+  { pathRe: /^\/teams\/[^/?#]+\/(?:start|stop)$/, methods: ['POST'] },
+  { pathRe: /^\/teams\/[^/?#]+\/activity$/, methods: ['GET'] },
+  { pathRe: /^\/tasks\/[^/?#]+\/[^/?#]+$/, methods: ['GET'] },
+  { pathRe: /^\/stats\/(?:summary|projects|models)$/, methods: ['GET'] },
+  { pathRe: /^\/stats\/refresh$/, methods: ['POST'] },
+  { pathRe: /^\/workflows$/, methods: ['GET'] },
+  { pathRe: /^\/workflows\/[^/?#]+$/, methods: ['GET'] },
+  { pathRe: /^\/workflows\/[^/?#]+\/run$/, methods: ['POST'] },
+];
+
+function buildSlashCommandHelp() {
+  return [
+    '命令模式（直连 codes server 端点）',
+    '',
+    '用法:',
+    '1) 直接 GET: /health 或 /projects',
+    '2) 显式方法: /get /stats/summary?period=week',
+    '3) 带 JSON body: /post /teams {"name":"ofb","workDir":"/home/bigb/projects/openclaw_for_business"}',
+    '4) 多行 body:',
+    '   /patch /teams/ofb/tasks/1',
+    '   {"action":"cancel"}',
+    '',
+    '支持方法: GET, POST, PATCH, DELETE',
+    '查看帮助: /help',
+  ].join('\n');
+}
+
+function parseSlashCommand(text) {
+  const raw = String(text ?? '').trim();
+  if (!raw.startsWith('/')) {
+    return { ok: false, error: 'not a slash command' };
+  }
+
+  const lines = raw.split(/\r?\n/);
+  const firstLine = lines[0].trim();
+  const restBody = lines.slice(1).join('\n').trim();
+  if (!firstLine) {
+    return { ok: false, error: 'empty command' };
+  }
+
+  const parts = firstLine.split(/\s+/).filter(Boolean);
+  if (parts.length === 0) {
+    return { ok: false, error: 'empty command' };
+  }
+
+  const first = parts[0].toLowerCase();
+  if (first === '/help' || first === '/?') {
+    return { ok: true, help: true };
+  }
+
+  let method = 'GET';
+  let target = '';
+  let inlineBody = '';
+
+  if (/^\/(get|post|patch|delete)$/i.test(first)) {
+    method = first.slice(1).toUpperCase();
+    if (parts.length < 2) {
+      return { ok: false, error: 'missing endpoint path' };
+    }
+    target = parts[1];
+    const head = `${parts[0]} ${parts[1]}`;
+    inlineBody = firstLine.startsWith(head) ? firstLine.slice(head.length).trim() : '';
+  } else {
+    target = parts[0];
+    if (parts.length > 1) {
+      return { ok: false, error: 'unexpected extra arguments; use /get /path?x=1 style' };
+    }
+  }
+
+  if (!target.startsWith('/') || target.startsWith('//')) {
+    return { ok: false, error: 'endpoint must start with a single /' };
+  }
+
+  const bodyRaw = restBody || inlineBody;
+  if (bodyRaw && !['POST', 'PATCH'].includes(method)) {
+    return { ok: false, error: `${method} does not accept request body in command mode` };
+  }
+
+  let body = null;
+  if (bodyRaw) {
+    try {
+      body = JSON.parse(bodyRaw);
+    } catch (e) {
+      return { ok: false, error: `invalid JSON body: ${e?.message || String(e)}` };
+    }
+  }
+
+  return { ok: true, help: false, method, target, body };
+}
+
+function findEndpointRule(pathname) {
+  return ENDPOINT_RULES.find((r) => r.pathRe.test(pathname)) || null;
+}
+
+function extractErrorMessage(obj) {
+  if (!obj || typeof obj !== 'object') return '';
+  if (typeof obj.error === 'string' && obj.error) return obj.error;
+  if (typeof obj.message === 'string' && obj.message) return obj.message;
+  return '';
+}
+
+async function callCodesEndpointByCommand(rawText) {
+  const parsed = parseSlashCommand(rawText);
+  if (!parsed.ok) {
+    return { text: `命令格式错误: ${parsed.error}\n\n${buildSlashCommandHelp()}`, mediaUrls: [] };
+  }
+  if (parsed.help) {
+    return { text: buildSlashCommandHelp(), mediaUrls: [] };
+  }
+
+  if (!HTTP_METHODS.has(parsed.method)) {
+    return { text: `不支持的方法: ${parsed.method}`, mediaUrls: [] };
+  }
+
+  const base = `http://127.0.0.1:${CODES_HTTP_PORT}`;
+  let url;
+  try {
+    url = new URL(parsed.target, base);
+  } catch (e) {
+    return { text: `路径解析失败: ${e?.message || String(e)}`, mediaUrls: [] };
+  }
+
+  if (url.origin !== base) {
+    return { text: '只允许访问本机 codes server', mediaUrls: [] };
+  }
+
+  const rule = findEndpointRule(url.pathname);
+  if (!rule) {
+    return { text: `端点不在允许列表中: ${url.pathname}\n\n${buildSlashCommandHelp()}`, mediaUrls: [] };
+  }
+  if (!rule.methods.includes(parsed.method)) {
+    return {
+      text: `方法不匹配: ${parsed.method} ${url.pathname}\n允许方法: ${rule.methods.join(', ')}`,
+      mediaUrls: [],
+    };
+  }
+
+  const headers = {
+    Accept: 'application/json',
+    Authorization: `Bearer ${CODES_HTTP_TOKEN}`,
+  };
+  const req = { method: parsed.method, headers };
+  if (parsed.body != null) {
+    req.body = JSON.stringify(parsed.body);
+    req.headers['Content-Type'] = 'application/json';
+  }
+
+  let resp;
+  try {
+    resp = await fetch(url, req);
+  } catch (e) {
+    return { text: `请求失败: ${e?.message || String(e)}`, mediaUrls: [] };
+  }
+
+  const contentType = String(resp.headers.get('content-type') || '').toLowerCase();
+  let payloadText = '';
+  let payloadJSON = null;
+
+  if (contentType.includes('application/json')) {
+    payloadJSON = await resp.json().catch(() => null);
+    if (payloadJSON != null) {
+      payloadText = JSON.stringify(payloadJSON, null, 2);
+    }
+  }
+  if (!payloadText) {
+    payloadText = await resp.text().catch(() => '');
+  }
+  payloadText = truncate(payloadText || '', SLASH_CMD_MAX_OUTPUT_CHARS);
+
+  const statusPrefix = resp.ok ? '[OK]' : '[ERR]';
+  const head = `${statusPrefix} ${parsed.method} ${url.pathname}${url.search} -> ${resp.status} ${resp.statusText}`;
+  const errMsg = !resp.ok ? extractErrorMessage(payloadJSON) : '';
+
+  if (errMsg && !payloadText) {
+    payloadText = errMsg;
+  }
+  if (!payloadText) {
+    return { text: head, mediaUrls: [] };
+  }
+  return { text: `${head}\n\n${payloadText}`, mediaUrls: [] };
 }
 
 // ─── Feishu message parsing ─────────────────────────────────────
@@ -1084,12 +1286,13 @@ const dispatcher = new Lark.EventDispatcher({}).register({
         // Remove @_user_X placeholders for routing decisions.
         const cleaned = (text || '').replace(/@_user_\d+\s*/g, '').trim();
         const decisionText = cleaned.startsWith('【Feishu消息】') ? '' : cleaned;
+        const slashCommandMode = decisionText.startsWith('/');
 
         // For attachment-only messages in groups: require @ mention.
-        if (hasAttachment && !mentioned && (!decisionText || decisionText === '[图片]' || decisionText === '[附件]')) return;
+        if (!slashCommandMode && hasAttachment && !mentioned && (!decisionText || decisionText === '[图片]' || decisionText === '[附件]')) return;
 
         // For pure text: apply the normal intent filter.
-        if (!hasAttachment && (!decisionText || !shouldRespondInGroup(decisionText, mentions))) return;
+        if (!slashCommandMode && !hasAttachment && (!decisionText || !shouldRespondInGroup(decisionText, mentions))) return;
 
         // Keep the cleaned text (so the agent doesn't see @_user_X noise)
         text = cleaned;
@@ -1119,7 +1322,10 @@ const dispatcher = new Lark.EventDispatcher({}).register({
         let replyText = '';
         let mediaUrls = [];
         try {
-          const r = await askAssistant({ text, sessionKey, attachments });
+          const slashCommandMode = String(text || '').trim().startsWith('/') && attachments.length === 0;
+          const r = slashCommandMode
+            ? await callCodesEndpointByCommand(text)
+            : await askAssistant({ text, sessionKey, attachments });
           if (typeof r === 'string') {
             replyText = r;
           } else {
@@ -1258,7 +1464,15 @@ async function runSelfTest() {
   const r = parseMediaLines('hello\nMEDIA: /tmp/a.mp4\nworld');
   ok('MEDIA parsed', r.mediaUrls.length === 1 && r.text.includes('hello') && r.text.includes('world'));
 
-  // 4) codes assistant health check
+  // 4) slash command parsing
+  const c1 = parseSlashCommand('/health');
+  ok('slash parse /health', c1.ok && c1.method === 'GET' && c1.target === '/health');
+  const c2 = parseSlashCommand('/post /teams {"name":"x"}');
+  ok('slash parse inline json', c2.ok && c2.method === 'POST' && c2.body?.name === 'x');
+  const c3 = parseSlashCommand('/patch /teams/ofb/tasks/1\n{"action":"cancel"}');
+  ok('slash parse multiline json', c3.ok && c3.method === 'PATCH' && c3.body?.action === 'cancel');
+
+  // 5) codes assistant health check
   try {
     const port = Number(process.env.CODES_HTTP_PORT ?? 3456);
     const hc = await fetch(`http://127.0.0.1:${port}/health`);
