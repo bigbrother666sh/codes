@@ -19,6 +19,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
 
 const HOME = os.homedir();
 const NODE_PATH = process.execPath; // e.g. /opt/homebrew/bin/node or /usr/bin/node
@@ -124,6 +125,35 @@ WantedBy=default.target
   fs.writeFileSync(outPath, unit);
   console.log(`Wrote: ${outPath}`);
   console.log();
+
+  // Enable linger so the user service survives logout
+  const user = os.userInfo().username;
+  let lingerEnabled = false;
+  try {
+    const lingerStatus = execSync(`loginctl show-user ${user} 2>/dev/null | grep Linger`, { encoding: 'utf8' }).trim();
+    lingerEnabled = lingerStatus === 'Linger=yes';
+  } catch { /* loginctl not available or user not logged in */ }
+
+  if (!lingerEnabled) {
+    console.log('Enabling linger (keeps user services running after logout)...');
+    try {
+      execSync(`loginctl enable-linger ${user}`, { stdio: 'inherit' });
+      lingerEnabled = true;
+    } catch {
+      try {
+        execSync(`sudo loginctl enable-linger ${user}`, { stdio: 'inherit' });
+        lingerEnabled = true;
+      } catch { /* both failed */ }
+    }
+    if (lingerEnabled) {
+      console.log(`[OK] Linger enabled for user "${user}"`);
+    } else {
+      console.warn(`[WARN] Failed to enable linger. Run manually:`);
+      console.warn(`  sudo loginctl enable-linger ${user}`);
+    }
+    console.log();
+  }
+
   console.log('To enable and start:');
   console.log('  systemctl --user daemon-reload');
   console.log('  systemctl --user enable codes-feishu-bridge');
