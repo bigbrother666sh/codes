@@ -88,13 +88,26 @@ else
   ok "Node.js $(node --version) 已安装"
 fi
 
+# ─── 配置 npm 用户级全局目录（使 Claude Code 可自动更新）────────
+info "配置 npm 用户级全局目录..."
+
+NPM_GLOBAL="$HOME/.npm-global"
+mkdir -p "$NPM_GLOBAL"
+npm config set prefix "$NPM_GLOBAL"
+
+if ! grep -q '.npm-global/bin' "$HOME/.profile" 2>/dev/null; then
+  echo 'export PATH=$HOME/.npm-global/bin:$PATH' >> "$HOME/.profile"
+fi
+export PATH="$NPM_GLOBAL/bin:$PATH"
+ok "npm 全局目录已配置: $NPM_GLOBAL"
+
 # ─── Phase 4: Claude Code CLI ────────────────────────────────────
 info "Phase 4/7: 安装 Claude Code CLI..."
 
 if command -v claude &>/dev/null; then
   ok "Claude Code 已安装: $(claude --version 2>/dev/null || echo 'unknown')"
 else
-  sudo npm install -g @anthropic-ai/claude-code > /dev/null 2>&1
+  npm install -g @anthropic-ai/claude-code > /dev/null 2>&1
   ok "Claude Code $(claude --version 2>/dev/null || echo '') 已安装"
 fi
 
@@ -277,7 +290,7 @@ ExecStart=/usr/local/bin/codes serve
 Restart=always
 RestartSec=5
 Environment=HOME=${HOME}
-Environment=PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=${HOME}/.npm-global/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=multi-user.target
