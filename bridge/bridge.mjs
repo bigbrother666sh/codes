@@ -435,6 +435,7 @@ class ClaudeProcess {
     this._pendingResolve = null;
     this._pendingReject = null;
     this._stdoutBuf = '';
+    this._interrupted = false;
   }
 
   _spawn() {
@@ -443,6 +444,7 @@ class ClaudeProcess {
       '--input-format', 'stream-json',
       '--dangerously-skip-permissions',
       '--verbose',
+      '--disallowedTools', 'EnterPlanMode,ExitPlanMode',
     ];
     if (this._sessionId) {
       args.push('--resume', this._sessionId);
@@ -591,13 +593,22 @@ class ClaudeProcess {
     }
     this._stdoutBuf = '';
 
-    // If we were waiting for a result, reject the pending promise
+    // If we were waiting for a result, resolve (if interrupted) or reject
     if (this._status === 'busy' && this._pendingReject) {
-      const reject = this._pendingReject;
-      this._pendingResolve = null;
-      this._pendingReject = null;
-      this._status = 'idle';
-      reject(new Error(`Claude process exited unexpectedly (code=${code}, signal=${signal})`));
+      if (this._interrupted) {
+        const resolve = this._pendingResolve;
+        this._pendingResolve = null;
+        this._pendingReject = null;
+        this._status = 'idle';
+        this._interrupted = false;
+        resolve({ text: '', interrupted: true, sessionId: this._sessionId, costUsd: 0 });
+      } else {
+        const reject = this._pendingReject;
+        this._pendingResolve = null;
+        this._pendingReject = null;
+        this._status = 'idle';
+        reject(new Error(`Claude process exited unexpectedly (code=${code}, signal=${signal})`));
+      }
     } else if (this._status !== 'stopped') {
       this._status = 'idle';
     }
@@ -639,6 +650,7 @@ class ClaudeProcess {
     this._stdoutBuf = '';
     this._pendingResolve = null;
     this._pendingReject = null;
+    this._interrupted = false;
   }
 
   info() {
@@ -649,6 +661,13 @@ class ClaudeProcess {
       costUsd: Math.round(this._costUsd * 10000) / 10000,
       turnCount: this._turnCount,
     };
+  }
+
+  interrupt() {
+    if (this._status !== 'busy' || !this._process) return false;
+    this._interrupted = true;
+    try { this._process.kill('SIGINT'); } catch {}
+    return true;
   }
 }
 
@@ -1417,10 +1436,14 @@ async function handleSlashCommand(pm, alias, text) {
         '/start [alias|all]  — 启动项目的 Claude Code',
         '/stop [alias|all]   — 停止项目的 Claude Code',
         '/reset [alias]      — 重置会话（清除历史，开始新对话）',
+        '/interrupt [alias]  — 打断当前正在处理的消息',
+        '/cost [alias]       — 查看费用（忙碌时显示 bridge 记录）',
+        '/context [alias]    — 查看会话信息（忙碌时显示 bridge 记录）',
         '/status             — 查看所有项目状态',
         '/help               — 显示此帮助',
         '',
         '其他 / 开头的消息会直接转发给 Claude Code。',
+        'Claude 忙碌时发送的消息会自动排队（保留最新一条）。',
         '',
         `当前项目: ${alias}`,
         `所有项目: ${pm.aliases().join(', ')}`,
@@ -1437,7 +1460,8 @@ async function handleSlashCommand(pm, alias, text) {
       const cost = info.costUsd > 0 ? `$${info.costUsd}` : '';
       const turns = info.turnCount > 0 ? `${info.turnCount}轮` : '';
       const session = info.sessionId ? `session=${info.sessionId.slice(0, 8)}…` : '';
-      const details = [pid, cost, turns, session].filter(Boolean).join(' ');
+      const queued = pendingMessages.has(a) ? '📨 有排队消息' : '';
+      const details = [pid, cost, turns, session, queued].filter(Boolean).join(' ');
       lines.push(`${flag} ${a} (${info.path})${details ? ' — ' + details : ''}`);
     }
     return { text: lines.join('\n') };
@@ -1469,8 +1493,153 @@ async function handleSlashCommand(pm, alias, text) {
     return { text: r.ok ? r.message : `错误: ${r.error}` };
   }
 
+  if (cmd === '/interrupt') {
+    const target = arg || alias;
+    const proj = pm.getProject(target);
+    if (!proj?.started) return { text: `项目 ${target} 未启动` };
+    const ok = proj.claude.interrupt();
+    return { text: ok ? `已发送打断信号给 ${target}` : `${target} 当前没有在处理消息` };
+  }
+
+  // /cost and /context: when busy, return bridge-level info immediately (no queue);
+  // when idle, pass through to Claude Code for full details.
+  if (cmd === '/cost' || cmd === '/context') {
+    const target = arg || alias;
+    const proj = pm.getProject(target);
+    if (!proj?.started) return { text: `项目 ${target} 未启动` };
+
+    const info = proj.claude.info();
+    if (info.status !== 'busy') return null; // idle → passthrough to Claude
+
+    if (cmd === '/cost') {
+      return {
+        text: [
+          `项目 ${target} 费用统计:`,
+          `累计费用: $${info.costUsd}`,
+          `对话轮数: ${info.turnCount}`,
+          '',
+          '(Claude 正在处理消息，显示 bridge 记录的累计数据)',
+        ].join('\n'),
+      };
+    }
+    return {
+      text: [
+        `项目 ${target} 会话信息:`,
+        `Session: ${info.sessionId ? info.sessionId.slice(0, 12) + '…' : '(无)'}`,
+        `PID: ${info.pid || '(未运行)'}`,
+        `状态: ${info.status}`,
+        '',
+        '(Claude 正在处理消息，详细上下文信息需等待处理完成后查询)',
+      ].join('\n'),
+    };
+  }
+
   // Unknown slash command — pass through to Claude Code as normal message
   return null;
+}
+
+// ─── Message queue (single-slot per project) ─────────────────────
+
+const pendingMessages = new Map(); // alias → { text, chatId, larkClient, thresholdMs }
+
+async function sendReplyToFeishu(larkClient, chatId, replyText, placeholderId) {
+  const parsed = parseMediaLines(replyText);
+  replyText = parsed.text;
+  let mediaUrls = parsed.mediaUrls || [];
+
+  const mdPaths = extractMarkdownLocalMediaPaths(replyText);
+  if (mdPaths.length > 0) {
+    for (const pth of mdPaths) {
+      const fp = path.resolve(pth);
+      if (isAllowedOutboundPath(fp)) mediaUrls.push(fp);
+    }
+    replyText = stripMarkdownLocalMediaRefs(replyText);
+  }
+
+  mediaUrls = [...new Set(mediaUrls)].slice(0, 4);
+
+  const trimmedText = (replyText || '').trim();
+  if ((!trimmedText || trimmedText === 'NO_REPLY' || trimmedText.endsWith('NO_REPLY')) && mediaUrls.length === 0) {
+    if (placeholderId) {
+      try { await deleteMessage(larkClient, placeholderId); } catch {}
+    }
+    return;
+  }
+
+  if (trimmedText.endsWith('NO_REPLY')) {
+    replyText = trimmedText.replace(/\s*NO_REPLY\s*$/g, '').trim();
+  }
+
+  try {
+    if (mediaUrls.length > 0) {
+      if (placeholderId) {
+        try { await deleteMessage(larkClient, placeholderId); } catch {}
+        placeholderId = '';
+      }
+      for (const u of mediaUrls.slice(0, 4)) {
+        await uploadAndSendMedia(larkClient, chatId, u, undefined);
+      }
+      if (replyText?.trim()) {
+        await sendText(larkClient, chatId, replyText.trim());
+      }
+      return;
+    }
+
+    if (placeholderId) {
+      try {
+        await updateTextMessage(larkClient, placeholderId, replyText);
+        return;
+      } catch {
+        // fall through
+      }
+    }
+
+    await sendText(larkClient, chatId, replyText);
+  } catch (err) {
+    if (placeholderId) {
+      try { await deleteMessage(larkClient, placeholderId); } catch {}
+    }
+    try {
+      await sendText(larkClient, chatId, `（发送失败）${err instanceof Error ? err.message : String(err)}`);
+    } catch {}
+  }
+}
+
+async function drainQueue(pm, alias) {
+  const entry = pendingMessages.get(alias);
+  if (!entry) return;
+  pendingMessages.delete(alias);
+
+  const { text, chatId, larkClient, thresholdMs } = entry;
+  const proj = pm.getProject(alias);
+  if (!proj?.started) return;
+
+  let placeholderId = '';
+  let done = false;
+
+  const timer = thresholdMs > 0
+    ? setTimeout(async () => {
+        if (done) return;
+        try {
+          const res = await sendText(larkClient, chatId, '正在思考…');
+          placeholderId = res?.data?.message_id || '';
+        } catch {}
+      }, thresholdMs)
+    : null;
+
+  let replyText = '';
+  try {
+    const result = await proj.claude.sendMessage(text);
+    replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
+  } catch (e) {
+    replyText = `（系统出错）${e?.message || String(e)}`;
+  } finally {
+    done = true;
+    if (timer) clearTimeout(timer);
+  }
+
+  await sendReplyToFeishu(larkClient, chatId, replyText, placeholderId);
+  await drainQueue(pm, alias);
 }
 
 // ─── Message handler factory ─────────────────────────────────────
@@ -1532,7 +1701,7 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
             : null;
 
         let replyText = '';
-        let mediaUrls = [];
+        let queued = false;
         try {
           const trimmed = String(text || '').trim();
           const isSlash = trimmed.startsWith('/') && attachments.length === 0;
@@ -1546,9 +1715,15 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
               const proj = pm.getProject(alias);
               if (!proj || !proj.started) {
                 replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
+              } else if (proj.claude.info().status === 'busy') {
+                const had = pendingMessages.has(alias);
+                pendingMessages.set(alias, { text: trimmed, chatId, larkClient, thresholdMs });
+                replyText = '⏳ Claude 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
+                if (had) replyText += '\n（已替换之前排队的消息）';
+                queued = true;
               } else {
                 const result = await proj.claude.sendMessage(trimmed);
-                replyText = String(result?.text ?? '');
+                replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
               }
             }
           } else {
@@ -1568,8 +1743,16 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
                 }
               }
 
-              const result = await proj.claude.sendMessage(fullText);
-              replyText = String(result?.text ?? '');
+              if (proj.claude.info().status === 'busy') {
+                const had = pendingMessages.has(alias);
+                pendingMessages.set(alias, { text: fullText, chatId, larkClient, thresholdMs });
+                replyText = '⏳ Claude 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
+                if (had) replyText += '\n（已替换之前排队的消息）';
+                queued = true;
+              } else {
+                const result = await proj.claude.sendMessage(fullText);
+                replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
+              }
             }
           }
         } catch (e) {
@@ -1579,77 +1762,10 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
           if (timer) clearTimeout(timer);
         }
 
-        // Support agent-produced media outputs
-        // 1) explicit MEDIA: lines in text
-        // 2) markdown local image refs like ![](/tmp/x.png)
-        const parsed = parseMediaLines(replyText);
-        replyText = parsed.text;
-        mediaUrls = mediaUrls.concat(parsed.mediaUrls || []);
+        await sendReplyToFeishu(larkClient, chatId, replyText, placeholderId);
 
-        const mdPaths = extractMarkdownLocalMediaPaths(replyText);
-        if (mdPaths.length > 0) {
-          for (const pth of mdPaths) {
-            const fp = path.resolve(pth);
-            if (isAllowedOutboundPath(fp)) mediaUrls.push(fp);
-          }
-          replyText = stripMarkdownLocalMediaRefs(replyText);
-        }
-
-        mediaUrls = [...new Set(mediaUrls)].slice(0, 4);
-
-        const trimmedText = (replyText || '').trim();
-        if ((!trimmedText || trimmedText === 'NO_REPLY' || trimmedText.endsWith('NO_REPLY')) && mediaUrls.length === 0) {
-          if (placeholderId) {
-            try {
-              await deleteMessage(larkClient, placeholderId);
-            } catch {}
-          }
-          return;
-        }
-
-        if (trimmedText.endsWith('NO_REPLY')) {
-          replyText = trimmedText.replace(/\s*NO_REPLY\s*$/g, '').trim();
-        }
-
-        try {
-          if (mediaUrls.length > 0) {
-            if (placeholderId) {
-              try {
-                await deleteMessage(larkClient, placeholderId);
-              } catch {}
-              placeholderId = '';
-            }
-
-            // Send each media (best-effort), then remaining text.
-            for (const u of mediaUrls.slice(0, 4)) {
-              await uploadAndSendMedia(larkClient, chatId, u, undefined);
-            }
-            if (replyText?.trim()) {
-              await sendText(larkClient, chatId, replyText.trim());
-            }
-            return;
-          }
-
-          if (placeholderId) {
-            try {
-              await updateTextMessage(larkClient, placeholderId, replyText);
-              return;
-            } catch {
-              // fall through
-            }
-          }
-
-          await sendText(larkClient, chatId, replyText);
-        } catch (err) {
-          // Last resort: try to clean placeholder and send an error message.
-          if (placeholderId) {
-            try {
-              await deleteMessage(larkClient, placeholderId);
-            } catch {}
-          }
-          try {
-            await sendText(larkClient, chatId, `（发送失败）${err instanceof Error ? err.message : String(err)}`);
-          } catch {}
+        if (!queued) {
+          await drainQueue(pm, alias);
         }
       });
     } catch (e) {
@@ -1698,7 +1814,16 @@ async function runSelfTest() {
   const info = cp.info();
   ok('ClaudeProcess info', info.status === 'idle' && info.sessionId === 'test-123' && info.turnCount === 0);
 
-  // 5) bridge config file check
+  // 5) interrupt returns false when not busy
+  ok('interrupt when idle', cp.interrupt() === false);
+
+  // 6) pendingMessages single-slot queue
+  pendingMessages.set('test', { text: 'a', chatId: 'c', larkClient: null, thresholdMs: 0 });
+  pendingMessages.set('test', { text: 'b', chatId: 'c', larkClient: null, thresholdMs: 0 });
+  ok('single-slot queue', pendingMessages.get('test').text === 'b');
+  pendingMessages.delete('test');
+
+  // 7) bridge config file check
   const cfgPath = resolvePath('~/.codes/bridge.json');
   if (fs.existsSync(cfgPath)) {
     try {

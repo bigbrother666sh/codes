@@ -57,7 +57,9 @@ bridge.mjs (单 Node.js 进程)
 - **stream-json 协议**: Claude CLI 的 `--output-format stream-json --input-format stream-json` 模式，stdin/stdout 通过 JSONL 通信
 - **会话持久化**: ClaudeProcess 自动保存 session-id，进程重启后以 `--resume` 恢复
 - **多 bot 初始化**: 每个 feishu.appId 对应独立的 Lark.Client + WSClient，一个 bridge 进程可服务多个飞书 bot
-- **飞书命令**: `/start`, `/stop`, `/status`, `/help` — 以 `/` 开头的消息作为控制命令处理
+- **飞书命令**: `/start`, `/stop`, `/reset`, `/interrupt`, `/cost`, `/context`, `/status`, `/help` — 以 `/` 开头的消息作为控制命令处理；未识别的斜杠命令透传给 Claude Code
+- **消息队列**: 单槽设计（pendingMessages Map），Claude 忙碌时新消息排队（保留最新一条），处理完自动 drainQueue
+- **打断机制**: `/interrupt` 发送 SIGINT，ClaudeProcess._interrupted 标记使 _onProcessExit 走 resolve 路径而非 reject
 - **immutable config**: 配置在启动时加载，运行时不修改原始对象
 
 ## CI

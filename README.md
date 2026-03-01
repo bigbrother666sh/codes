@@ -1,6 +1,20 @@
-# Codes — 飞书 × Claude Code Bridge
+# Codes — 打造你专属的 7*24 小时云端开发牛马（基于 claude code）
 
-通过飞书机器人操控服务器上的 Claude Code，让 AI 编程助手随时在线。
+简单说，就是把 claude code 装在云服务器上，然后接入飞书。这样你就可以让它 7*24 为你开发了，因为 claude code 配合顶级的大模型开发能力已经足够强大（基本强于 985 研究生），所以就算你不懂开发也没问题，你就是老板，通过飞书下达指令，不管跟他讨论实现方案，还是让它给你出开发计划，抑或最终的开发实现、部署上线……你只需要用手机、飞书对话……懂不懂技术都没所谓。
+
+<img src="docs/codes.png" alt="codes running demo" style="width: 90%;"/>
+
+即便你是编程老手，其实用这个模式也很有价值，你可以从电脑前彻底解放，随时随地……
+
+# 🌟 与 claude code 原版的 RC（remote control）功能相比
+
+- 不需要 max/pro 订阅；
+- 因为不需要订阅，因此可以用国内的第三方代理方案，也可以直接用 minimax 或者 kimi、glm、qwen 等 coding 套餐；
+- 省不省钱的先不说，至少网络环境和账号这些麻烦不会存在了……
+
+顺便推荐一下，[Noin.ai](https://noin.ai/) 量大盘稳
+
+至于云端服务器，2C4G 足够了，腾讯云首单一年 79……
 
 ## 架构
 
@@ -97,14 +111,21 @@ FEISHU_BRIDGE_MAX_INBOUND_FILE_MB=40   # 入站文件大小限制
 
 ### 飞书自建应用创建步骤
 
-1. 前往 [飞书开放平台](https://open.feishu.cn/app) → 创建自建应用
-2. 在「权限管理」中添加：
-   - `im:message` — 接收消息
-   - `im:message:send_as_bot` — 以机器人身份发送消息
-   - `im:resource` — 读取资源（图片/文件）
-3. 在「事件与回调」中启用 **WebSocket 模式**（长连接，无需公网 IP）
-4. 记录 App ID 和 App Secret
-5. 发布应用版本
+1. 打开 [飞书开放平台](https://open.feishu.cn/app)，登录
+2. 点击 **创建自建应用**
+3. 填写应用名称（随意，比如 "My AI Assistant"）
+4. 进入应用 → **添加应用能力** → 选择 **机器人**
+5. 进入 **权限管理**，开通以下权限（推荐照抄，少踩坑）：
+   - `im:message` — 获取与发送消息
+   - `im:message:send_as_bot` — 以机器人身份发消息（避免 403）
+   - `im:message.group_at_msg` — 接收群聊中 @ 机器人的消息
+   - `im:message.p2p_msg` — 接收机器人单聊消息
+   - `im:resource` — 上传/下载图片与文件（**收图/收视频**必须）
+6. 进入 **事件与回调** → **事件配置**：
+   - 添加事件：`接收消息 im.message.receive_v1`
+   - 请求方式选择：**使用长连接接收事件**（这是关键！）
+7. 发布应用（创建版本 → 申请上线）
+8. 记下 **App ID** 和 **App Secret**（在"凭证与基础信息"页面）
 
 ## 飞书命令
 
@@ -114,10 +135,35 @@ FEISHU_BRIDGE_MAX_INBOUND_FILE_MB=40   # 入站文件大小限制
 |------|------|
 | `/start [alias\|all]` | 启动项目的 Claude Code |
 | `/stop [alias\|all]` | 停止项目的 Claude Code |
+| `/reset [alias]` | 重置会话（清除历史，开始新对话） |
+| `/interrupt [alias]` | 打断当前正在处理的消息 |
+| `/cost [alias]` | 查看费用统计 |
+| `/context [alias]` | 查看会话信息 |
 | `/status` | 查看所有项目状态 |
 | `/help` | 显示帮助 |
 
-普通消息会直接发送给对应项目的 Claude Code 处理。
+其他 `/` 开头的消息会直接转发给 Claude Code（如 Claude 内置的 `/compact` 等）。
+普通消息直接发送给对应项目的 Claude Code 处理。
+
+### 消息队列与打断
+
+当 Claude 正在处理上一条消息时，新发送的消息会自动排队（单槽设计，仅保留最新一条）：
+
+```
+用户发 A  →  Claude 开始处理
+用户发 B  →  "⏳ 消息已排队" → B 进入等待
+用户发 C  →  "⏳ 消息已排队（替换）" → C 替换 B
+A 处理完  →  回复 A 结果  →  自动开始处理 C
+```
+
+如需打断当前处理，发送 `/interrupt`：
+
+```
+用户发 A  →  Claude 处理中
+用户发 /interrupt  →  打断 A  →  自动处理排队消息（如有）
+```
+
+`/cost` 和 `/context` 不受队列限制——Claude 忙碌时返回 bridge 记录的数据，空闲时透传给 Claude Code 返回详细信息。
 
 ## 服务���部署
 
