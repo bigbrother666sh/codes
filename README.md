@@ -2,7 +2,7 @@
 
 简单说，就是把 claude code 装在云服务器上，然后接入飞书。这样你就可以让它 7*24 为你开发了，因为 claude code 配合顶级的大模型开发能力已经足够强大（基本强于 985 研究生），所以就算你不懂开发也没问题，你就是老板，通过飞书下达指令，不管跟他讨论实现方案，还是让它给你出开发计划，抑或最终的开发实现、部署上线……你只需要用手机、飞书对话……懂不懂技术都没所谓。
 
-<img src="docs/codes.png" alt="codes running demo" style="width: 90%;"/>
+<img src="docs/codes.png" alt="codes running demo" style="width: 100%;"/>
 
 即便你是编程老手，其实用这个模式也很有价值，你可以从电脑前彻底解放，随时随地……
 
@@ -15,6 +15,19 @@
 顺便推荐一下，[Noin.ai](https://noin.ai/) 量大盘稳
 
 至于云端服务器，2C4G 足够了，腾讯云首单一年 79……
+
+**🌹 致敬：飞书连接桥方案来自：https://github.com/AlexAnys/feishu-openclaw**
+
+**🎯 来自 https://github.com/affaan-m/everything-claude-code 的 claude code 强化插件**
+
+本项目会直接安装来自 Anthropic 黑客马拉松获胜者的完整 Claude Code 配置集合。让你的 claude code 直接继承十年程序员开发功力！
+
+生产级代理、技能、钩子、命令、规则和 MCP 配置，经过 10 多个月构建真实产品的密集日常使用而演化。
+
+同时经过 modified，更加符合中国网络环境。
+
+MCP 部分，需要去 https://jina.ai/ 申请 api key（十分便宜），并编辑 ~/claude.json
+
 
 ## 架构
 
