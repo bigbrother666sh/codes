@@ -1436,6 +1436,7 @@ async function handleSlashCommand(pm, alias, text) {
         '/start [alias|all]  — 启动项目的 Claude Code',
         '/stop [alias|all]   — 停止项目的 Claude Code',
         '/reset [alias]      — 重置会话（清除历史，开始新对话）',
+        '/clear [alias]      — 同 /reset',
         '/interrupt [alias]  — 打断当前正在处理的消息',
         '/cost [alias]       — 查看费用（忙碌时显示 bridge 记录）',
         '/context [alias]    — 查看会话信息（忙碌时显示 bridge 记录）',
@@ -1487,7 +1488,7 @@ async function handleSlashCommand(pm, alias, text) {
     return { text: r.ok ? r.message : `错误: ${r.error}` };
   }
 
-  if (cmd === '/reset') {
+  if (cmd === '/reset' || cmd === '/clear') {
     const target = arg || alias;
     const r = await pm.resetProject(target);
     return { text: r.ok ? r.message : `错误: ${r.error}` };
@@ -1631,6 +1632,7 @@ async function drainQueue(pm, alias) {
   try {
     const result = await proj.claude.sendMessage(text);
     replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
+    if (!replyText.trim()) replyText = '✅ 已执行（无输出）';
   } catch (e) {
     replyText = `（系统出错）${e?.message || String(e)}`;
   } finally {
@@ -1724,6 +1726,7 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
               } else {
                 const result = await proj.claude.sendMessage(trimmed);
                 replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
+                if (!replyText.trim()) replyText = `✅ ${trimmed.split(/\s/)[0]} 已执行`;
               }
             }
           } else {
@@ -1752,6 +1755,7 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
               } else {
                 const result = await proj.claude.sendMessage(fullText);
                 replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
+                if (!replyText.trim()) replyText = '✅ 已执行（无输出）';
               }
             }
           }
