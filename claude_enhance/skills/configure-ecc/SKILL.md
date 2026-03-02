@@ -1,6 +1,7 @@
 ---
 name: configure-ecc
 description: Interactive installer for Everything Claude Code — guides users through selecting and installing skills and rules to user-level or project-level directories, verifies paths, and optionally optimizes installed files.
+origin: ECC
 ---
 
 # Configure Everything Claude Code (ECC)
@@ -63,7 +64,23 @@ mkdir -p $TARGET/skills $TARGET/rules
 
 ## Step 2: Select & Install Skills
 
-### 2a: Choose Skill Categories
+### 2a: Choose Scope (Core vs Niche)
+
+Default to **Core (recommended for new users)** — copy `.agents/skills/*` plus `skills/search-first/` for research-first workflows. This bundle covers engineering, evals, verification, security, strategic compaction, frontend design, and Anthropic cross-functional skills (article-writing, content-engine, market-research, frontend-slides).
+
+Use `AskUserQuestion` (single select):
+```
+Question: "Install core skills only, or include niche/framework packs?"
+Options:
+  - "Core only (recommended)" — "tdd, e2e, evals, verification, research-first, security, frontend patterns, compacting, cross-functional Anthropic skills"
+  - "Core + selected niche" — "Add framework/domain-specific skills after core"
+  - "Niche only" — "Skip core, install specific framework/domain skills"
+Default: Core only
+```
+
+If the user chooses niche or core + niche, continue to category selection below and only include those niche skills they pick.
+
+### 2b: Choose Skill Categories
 
 There are 27 skills organized into 4 categories. Use `AskUserQuestion` with `multiSelect: true`:
 
@@ -76,11 +93,11 @@ Options:
   - "All skills" — "Install every available skill"
 ```
 
-### 2b: Confirm Individual Skills
+### 2c: Confirm Individual Skills
 
 For each selected category, print the full list of skills below and ask the user to confirm or deselect specific ones. If the list exceeds 4 items, print the list as text and use `AskUserQuestion` with an "Install all listed" option plus "Other" for the user to paste specific names.
 
-**Category: Framework & Language (16 skills)**
+**Category: Framework & Language (17 skills)**
 
 | Skill | Description |
 |-------|-------------|
@@ -91,6 +108,7 @@ For each selected category, print the full list of skills below and ask the user
 | `django-tdd` | Django testing with pytest-django, factory_boy, mocking, coverage |
 | `django-verification` | Django verification loop: migrations, linting, tests, security scans |
 | `frontend-patterns` | React, Next.js, state management, performance, UI patterns |
+| `frontend-slides` | Zero-dependency HTML presentations, style previews, and PPTX-to-web conversion |
 | `golang-patterns` | Idiomatic Go patterns, conventions for robust Go applications |
 | `golang-testing` | Go testing: table-driven tests, subtests, benchmarks, fuzzing |
 | `java-coding-standards` | Java coding standards for Spring Boot: naming, immutability, Optional, streams |
@@ -122,13 +140,23 @@ For each selected category, print the full list of skills below and ask the user
 | `tdd-workflow` | Enforces TDD with 80%+ coverage: unit, integration, E2E |
 | `verification-loop` | Verification and quality loop patterns |
 
+**Category: Business & Content (5 skills)**
+
+| Skill | Description |
+|-------|-------------|
+| `article-writing` | Long-form writing in a supplied voice using notes, examples, or source docs |
+| `content-engine` | Multi-platform social content, scripts, and repurposing workflows |
+| `market-research` | Source-attributed market, competitor, fund, and technology research |
+| `investor-materials` | Pitch decks, one-pagers, investor memos, and financial models |
+| `investor-outreach` | Personalized investor cold emails, warm intros, and follow-ups |
+
 **Standalone**
 
 | Skill | Description |
 |-------|-------------|
 | `project-guidelines-example` | Template for creating project-specific skills |
 
-### 2c: Execute Installation
+### 2d: Execute Installation
 
 For each selected skill, copy the entire skill directory:
 ```bash
