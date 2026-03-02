@@ -90,6 +90,7 @@ const MAX_INBOUND_IMAGE_MB = Number(process.env.FEISHU_BRIDGE_MAX_INBOUND_IMAGE_
 const MAX_INBOUND_FILE_MB = Number(process.env.FEISHU_BRIDGE_MAX_INBOUND_FILE_MB ?? 40);
 const INBOUND_FILE_TTL_MIN = Number(process.env.FEISHU_BRIDGE_INBOUND_FILE_TTL_MIN ?? 60);
 const MAX_ATTACHMENTS = Number(process.env.FEISHU_BRIDGE_MAX_ATTACHMENTS ?? 4);
+const PROGRESS_UPDATE_INTERVAL_MS = Number(process.env.FEISHU_BRIDGE_PROGRESS_INTERVAL_MS ?? 15000);
 
 const SELFTEST = process.argv.includes('--selftest') || process.env.FEISHU_BRIDGE_SELFTEST === '1';
 let DEBUG = process.env.FEISHU_BRIDGE_DEBUG === '1';
@@ -99,6 +100,14 @@ const BRIDGE_VERSION = readBridgeVersion();
 
 function resolvePath(p) {
   return String(p || '').replace(/^~/, os.homedir());
+}
+
+function formatElapsed(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}秒`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return rem > 0 ? `${m}分${rem}秒` : `${m}分钟`;
 }
 
 function readBridgeVersion() {
@@ -436,6 +445,8 @@ class ClaudeProcess {
     this._pendingReject = null;
     this._stdoutBuf = '';
     this._interrupted = false;
+    this._busySince = null;       // Date.now() when sendMessage starts
+    this._lastActivity = null;    // { type, tool, ts } from intermediate events
   }
 
   _spawn() {
@@ -493,6 +504,8 @@ class ClaudeProcess {
     }
 
     this._status = 'busy';
+    this._busySince = Date.now();
+    this._lastActivity = { type: 'thinking', tool: null, ts: Date.now() };
 
     return new Promise((resolve, reject) => {
       this._pendingResolve = resolve;
@@ -538,11 +551,25 @@ class ClaudeProcess {
           this._sessionId = event.session_id;
         }
 
+        // Track intermediate activity for progress updates
+        if (event.type === 'assistant') {
+          const toolUse = Array.isArray(event.content)
+            ? event.content.find(b => b.type === 'tool_use')
+            : null;
+          this._lastActivity = {
+            type: toolUse ? 'tool_use' : 'thinking',
+            tool: toolUse?.name || null,
+            ts: Date.now(),
+          };
+        }
+
         if (event.type === 'result') {
           const resultText = String(event.result || '');
           if (event.cost_usd != null) this._costUsd += Number(event.cost_usd) || 0;
           this._turnCount++;
           this._status = 'idle';
+          this._busySince = null;
+          this._lastActivity = null;
 
           if (this._pendingResolve) {
             const resolve = this._pendingResolve;
@@ -661,6 +688,16 @@ class ClaudeProcess {
       costUsd: Math.round(this._costUsd * 10000) / 10000,
       turnCount: this._turnCount,
     };
+  }
+
+  progressText() {
+    if (this._status !== 'busy' || !this._busySince) return null;
+    const elapsed = formatElapsed(Date.now() - this._busySince);
+    const act = this._lastActivity;
+    if (act?.type === 'tool_use' && act.tool) {
+      return `正在处理… ${elapsed} | 工具: ${act.tool}`;
+    }
+    return `正在思考… ${elapsed}`;
   }
 
   interrupt() {
@@ -1617,6 +1654,7 @@ async function drainQueue(pm, alias) {
 
   let placeholderId = '';
   let done = false;
+  let progressInterval = null;
 
   const timer = thresholdMs > 0
     ? setTimeout(async () => {
@@ -1624,6 +1662,15 @@ async function drainQueue(pm, alias) {
         try {
           const res = await sendText(larkClient, chatId, '正在思考…');
           placeholderId = res?.data?.message_id || '';
+          if (placeholderId && PROGRESS_UPDATE_INTERVAL_MS > 0) {
+            progressInterval = setInterval(async () => {
+              if (done || !placeholderId) { clearInterval(progressInterval); return; }
+              const progress = proj.claude.progressText();
+              if (progress) {
+                try { await updateTextMessage(larkClient, placeholderId, progress); } catch {}
+              }
+            }, PROGRESS_UPDATE_INTERVAL_MS);
+          }
         } catch {}
       }, thresholdMs)
     : null;
@@ -1638,6 +1685,7 @@ async function drainQueue(pm, alias) {
   } finally {
     done = true;
     if (timer) clearTimeout(timer);
+    if (progressInterval) clearInterval(progressInterval);
   }
 
   await sendReplyToFeishu(larkClient, chatId, replyText, placeholderId);
@@ -1688,6 +1736,7 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
       setImmediate(async () => {
         let placeholderId = '';
         let done = false;
+        let progressInterval = null;
 
         const timer =
           thresholdMs > 0
@@ -1696,6 +1745,16 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
                 try {
                   const res = await sendText(larkClient, chatId, '正在思考…');
                   placeholderId = res?.data?.message_id || '';
+                  if (placeholderId && PROGRESS_UPDATE_INTERVAL_MS > 0) {
+                    progressInterval = setInterval(async () => {
+                      if (done || !placeholderId) { clearInterval(progressInterval); return; }
+                      const proj = pm.getProject(alias);
+                      const progress = proj?.claude?.progressText();
+                      if (progress) {
+                        try { await updateTextMessage(larkClient, placeholderId, progress); } catch {}
+                      }
+                    }, PROGRESS_UPDATE_INTERVAL_MS);
+                  }
                 } catch {
                   // ignore
                 }
@@ -1764,6 +1823,7 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
         } finally {
           done = true;
           if (timer) clearTimeout(timer);
+          if (progressInterval) clearInterval(progressInterval);
         }
 
         await sendReplyToFeishu(larkClient, chatId, replyText, placeholderId);
