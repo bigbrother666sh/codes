@@ -134,9 +134,31 @@ FEISHU_BRIDGE_MAX_INBOUND_FILE_MB=40   # 入站文件大小限制
    - `im:message.group_at_msg` — 接收群聊中 @ 机器人的消息
    - `im:message.p2p_msg` — 接收机器人单聊消息
    - `im:resource` — 上传/下载图片与文件（**收图/收视频**必须）
+  
+或者选择“批量导入/导出权限”复制如下
+
+```json
+{
+  "scopes": {
+    "tenant": [
+      "im:resource",
+      "im:message",
+      "im:message.group_at_msg:readonly",
+      "im:message.p2p_msg:readonly",
+      "im:message:readonly",
+      "im:message:send_as_bot"
+    ],
+    "user": []
+  }
+}
+```
+
 6. 进入 **事件与回调** → **事件配置**：
    - 添加事件：`接收消息 im.message.receive_v1`
    - 请求方式选择：**使用长连接接收事件**（这是关键！）
+   
+   *坑点：此时要保证 codes 已在运行*
+   
 7. 发布应用（创建版本 → 申请上线）
 8. 记下 **App ID** 和 **App Secret**（在"凭证与基础信息"页面）
 
