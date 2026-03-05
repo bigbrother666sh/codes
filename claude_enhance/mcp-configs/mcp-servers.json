@@ -8,75 +8,19 @@
       },
       "description": "GitHub operations - PRs, issues, repos"
     },
-    "firecrawl": {
-      "command": "npx",
-      "args": ["-y", "firecrawl-mcp"],
-      "env": {
-        "FIRECRAWL_API_KEY": "YOUR_FIRECRAWL_KEY_HERE"
-      },
-      "description": "Web scraping and crawling"
-    },
-    "supabase": {
-      "command": "npx",
-      "args": ["-y", "@supabase/mcp-server-supabase@latest", "--project-ref=YOUR_PROJECT_REF"],
-      "description": "Supabase database operations"
-    },
     "memory": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-memory"],
       "description": "Persistent memory across sessions"
-    },
-    "sequential-thinking": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
-      "description": "Chain-of-thought reasoning"
-    },
-    "vercel": {
-      "type": "http",
-      "url": "https://mcp.vercel.com",
-      "description": "Vercel deployments and projects"
-    },
-    "railway": {
-      "command": "npx",
-      "args": ["-y", "@railway/mcp-server"],
-      "description": "Railway deployments"
-    },
-    "cloudflare-docs": {
-      "type": "http",
-      "url": "https://docs.mcp.cloudflare.com/mcp",
-      "description": "Cloudflare documentation search"
-    },
-    "cloudflare-workers-builds": {
-      "type": "http",
-      "url": "https://builds.mcp.cloudflare.com/mcp",
-      "description": "Cloudflare Workers builds"
-    },
-    "cloudflare-workers-bindings": {
-      "type": "http",
-      "url": "https://bindings.mcp.cloudflare.com/mcp",
-      "description": "Cloudflare Workers bindings"
-    },
-    "cloudflare-observability": {
-      "type": "http",
-      "url": "https://observability.mcp.cloudflare.com/mcp",
-      "description": "Cloudflare observability/logs"
     },
     "clickhouse": {
       "type": "http",
       "url": "https://mcp.clickhouse.cloud/mcp",
       "description": "ClickHouse analytics queries"
     },
-    "exa-web-search": {
-      "command": "npx",
-      "args": ["-y", "exa-mcp-server"],
-      "env": {
-        "EXA_API_KEY": "YOUR_EXA_API_KEY_HERE"
-      },
-      "description": "Web search, research, and data ingestion via Exa API — recommended for research-first development workflow"
-    },
     "context7": {
       "command": "npx",
-      "args": ["-y", "@context7/mcp-server"],
+      "args": ["-y", "@upstash/context7-mcp"],
       "description": "Live documentation lookup"
     },
     "magic": {
@@ -84,10 +28,12 @@
       "args": ["-y", "@magicuidesign/mcp@latest"],
       "description": "Magic UI components"
     },
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/your/projects"],
-      "description": "Filesystem operations (set your path)"
+    "jina": {
+      "type": "http",
+      "url": "https://mcp.jina.ai/v1",
+      "headers": {
+        "Authorization": "Bearer YOUR_*_HERE"
+      }
     }
   },
   "_comments": {

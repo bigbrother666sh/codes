@@ -172,6 +172,7 @@ else
   cat > "$HOME/.claude/settings.json" << 'SETTINGSEOF'
 {
   "model": "sonnet",
+  "effortLevel": "high",
   "language": "简体中文"
 }
 SETTINGSEOF
@@ -304,6 +305,10 @@ if (fs.existsSync(settingsPath)) {
 
 // 合并 hooks
 settings.hooks = processedHooks;
+
+// 设置默认模型（若未配置）
+settings.model = settings.model || 'sonnet';
+settings.effortLevel = settings.effortLevel || 'high';
 
 // 移除 everything-claude-code 插件引用（已改为直接安装）
 if (settings.enabledPlugins) {
