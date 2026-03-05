@@ -60,6 +60,7 @@ bridge.mjs (单 Node.js 进程)
 - **飞书命令**: `/start`, `/stop`, `/reset`, `/interrupt`, `/cost`, `/context`, `/status`, `/help` — 以 `/` 开头的消息作为控制命令处理；未识别的斜杠命令透传给 Claude Code
 - **消息队列**: 单槽设计（pendingMessages Map），Claude 忙碌时新消息排队（保留最新一条），处理完自动 drainQueue
 - **打断机制**: `/interrupt` 发送 SIGINT，ClaudeProcess._interrupted 标记使 _onProcessExit 走 resolve 路径而非 reject
+- **延迟发送**：`/小时-分钟 “要延迟发送的消息”` xx 小时 xxx 分钟后，内容发给 claude code
 - **immutable config**: 配置在启动时加载，运行时不修改原始对象
 
 ## CI

@@ -8,13 +8,15 @@
 
 # 🌟 与 claude code 原版的 RC（remote control）功能相比
 
+🚀【2026.3.5】新增：延迟消息（计划消息），`/小时-分钟 “要延迟发送的消息”` （xx 小时 xxx 分钟后，内容发给 claude code）
+
 - 不需要 max/pro 订阅；
 - 因为不需要订阅，因此可以用国内的第三方代理方案，也可以直接用 minimax 或者 kimi、glm、qwen 等 coding 套餐；
 - 省不省钱的先不说，至少网络环境和账号这些麻烦不会存在了……
 
 顺便推荐一下，[Noin.ai](https://noin.ai/) 量大盘稳
 
-至于云端服务器，2C4G 足够了，腾讯云首单一年 79……
+至于云端服务器，2C4G 足够了，腾讯云首单一年 79……当然因为本项目不需要公网 IP，所以你搞台二手电脑装个 ubuntu 扔家里或者办公室也是可以的……硬件几乎零成本。
 
 **🌹 致敬：飞书连接桥方案来自：https://github.com/AlexAnys/feishu-openclaw**
 
@@ -149,36 +151,6 @@ FEISHU_BRIDGE_MAX_INBOUND_FILE_MB=40   # 入站文件大小限制
   }
 }
 ```
-
-### mcp的配置
-
-本项目安装部署时，会自动应用 claude_enhance 里面的来自[everything-claude-code](https://github.com/affaan-m/everything-claude-code) —— The performance optimization system for AI agent harnesses. From an Anthropic hackathon winner. 的最佳实践配置，不仅能让你的 claude code 发挥最大能力，还能有效降低 token（通过细腻的分层任务自动切换不同的模型，以及跨 session 的持久记忆）
-
-但是原版的 mcp 过于庞杂，很多也不适合国内环境，因此我精简为五个：github、memory、context7、magic、jina，这五个应该是编程都需要的
-
-其中 github 需要你的 PAT，获取方式为：
-
-```text
-GITHUB_PERSONAL_ACCESS_TOKEN 是在 GitHub 里创建的个人访问令牌（PAT）。
-
-打开 GitHub 的 Token 页面
-https://github.com/settings/personal-access-tokens
-
-选择创建方式
-
-推荐：Fine-grained token（权限更细、更安全）
-兼容旧工具：Tokens (classic)
-按你的 MCP 用途勾权限
-
-只读仓库：Contents: Read
-需要提 Issue / PR：再加 Issues、Pull requests 的 Read and write
-如果 classic token，常见最小是：repo（私有仓库）和 read:org（如需组织信息）
-创建后复制 token 到 .claude.json 的 mcpserver-github 下
-```
-
-jina 需要获取 key，获取地址为：https://jina.ai/ 申请 api key，十分便宜
-
-
 6. 进入 **事件与回调** → **事件配置**：
    - 添加事件：`接收消息 im.message.receive_v1`
    - 请求方式选择：**使用长连接接收事件**（这是关键！）
@@ -226,7 +198,14 @@ A 处理完  →  回复 A 结果  →  自动开始处理 C
 
 `/cost` 和 `/context` 不受队列限制——Claude 忙碌时返回 bridge 记录的数据，空闲时透传给 Claude Code 返回详细信息。
 
-## 服务���部署
+### 延迟消息发送
+
+/xx-dd 消息：xx 小时 dd 分钟后发送一次（例：/2-15 服务器维护）【意味着从发送起2 小时 15 分钟后，把“服务器维护”这句话发给 claude code）
+/scheduled [alias]：查看当前待发送定时任务
+/unschedule <任务ID前缀> [alias]：撤回单个定时任务
+/unschedule all [alias]：撤回该项目全部定时任务
+
+## 服务部署
 
 ### 一键部署（Ubuntu 24.04）
 
@@ -235,6 +214,34 @@ curl -fsSL https://raw.githubusercontent.com/bigbrother666sh/codes/main/deploy.s
 ```
 
 脚本会自动安装 Node.js、Claude Code CLI，引导配置飞书凭据，并创建 systemd 服务。
+
+### mcp的配置
+
+本项目安装部署时，会自动应用 claude_enhance 里面的来自[everything-claude-code](https://github.com/affaan-m/everything-claude-code) —— The performance optimization system for AI agent harnesses. From an Anthropic hackathon winner. 的最佳实践配置，不仅能让你的 claude code 发挥最大能力，还能有效降低 token（通过细腻的分层任务自动切换不同的模型，以及跨 session 的持久记忆）
+
+但是原版的 mcp 过于庞杂，很多也不适合国内环境，因此我精简为五个：github、memory、context7、magic、jina，这五个应该是编程都需要的
+
+其中 github 需要你的 PAT，获取方式为：
+
+```text
+GITHUB_PERSONAL_ACCESS_TOKEN 是在 GitHub 里创建的个人访问令牌（PAT）。
+
+打开 GitHub 的 Token 页面
+https://github.com/settings/personal-access-tokens
+
+选择创建方式
+
+推荐：Fine-grained token（权限更细、更安全）
+兼容旧工具：Tokens (classic)
+按你的 MCP 用途勾权限
+
+只读仓库：Contents: Read
+需要提 Issue / PR：再加 Issues、Pull requests 的 Read and write
+如果 classic token，常见最小是：repo（私有仓库）和 read:org（如需组织信息）
+创建后复制 token 到 .claude.json 的 mcpserver-github 下
+```
+
+jina 需要获取 key，获取地址为：https://jina.ai/ 申请 api key，十分便宜
 
 ### 手动部署
 

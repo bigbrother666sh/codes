@@ -110,6 +110,60 @@ function formatElapsed(ms) {
   return rem > 0 ? `${m}分${rem}秒` : `${m}分钟`;
 }
 
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+function formatLocalDateTime(d) {
+  const date = new Date(d);
+  return [
+    `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`,
+    `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`,
+  ].join(' ');
+}
+
+function computeDelayScheduleTime(hours, minutes, now = new Date()) {
+  const base = new Date(now.getTime());
+  const delayMs = (Math.max(0, hours) * 60 + Math.max(0, minutes)) * 60 * 1000;
+  return new Date(base.getTime() + delayMs);
+}
+
+/**
+ * Parse one-off delayed send command:
+ *   /xx-dd message...  => xx hours later + dd minutes later
+ * Returns:
+ *   null                                      -> not a delayed-send command
+ *   { error: string }                         -> command format but invalid
+ *   { hours: number, minutes: number, text: string } -> valid delayed-send command
+ */
+function parseDelayedSendCommand(rawText) {
+  const raw = String(rawText ?? '').trim();
+  const m = raw.match(/^\/(\d{1,5})-(\d{1,2})(?:\s+([\s\S]*))?$/);
+  if (!m) return null;
+
+  const hours = Number(m[1]);
+  const minutes = Number(m[2]);
+  const text = String(m[3] || '').trim();
+
+  if (!Number.isInteger(hours) || hours < 0 || hours > 999) {
+    return { error: '小时必须在 0-999 之间。' };
+  }
+  if (!Number.isInteger(minutes) || minutes < 0 || minutes > 59) {
+    return { error: '分钟必须在 00-59 之间。' };
+  }
+  if (hours === 0 && minutes === 0) {
+    return { error: '延迟时间不能为 0。示例: /0-10 十分钟后提醒我' };
+  }
+  if (!text) {
+    return { error: '定时消息内容不能为空。示例: /2-30 两小时三十分钟后提醒我' };
+  }
+  return { hours, minutes, text };
+}
+
+function isLegacyClockScheduleCommand(rawText) {
+  return /^\/\d{1,2}:\d{2}\b/.test(String(rawText ?? '').trim());
+}
+
 function readBridgeVersion() {
   try {
     const pkgPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'package.json');
@@ -1478,6 +1532,10 @@ async function handleSlashCommand(pm, alias, text) {
         '/cost [alias]       — 查看费用（忙碌时显示 bridge 记录）',
         '/context [alias]    — 查看会话信息（忙碌时显示 bridge 记录）',
         '/status             — 查看所有项目状态',
+        '/xx-dd 消息         — xx小时dd分钟后自动发送（一次）',
+        '/scheduled [alias]  — 查看待发送定时任务',
+        '/unschedule <id> [alias] — 撤回一个定时任务（支持 ID 前缀）',
+        '/unschedule all [alias]  — 撤回该项目所有定时任务',
         '/help               — 显示此帮助',
         '',
         '其他 / 开头的消息会直接转发给 Claude Code。',
@@ -1499,10 +1557,59 @@ async function handleSlashCommand(pm, alias, text) {
       const turns = info.turnCount > 0 ? `${info.turnCount}轮` : '';
       const session = info.sessionId ? `session=${info.sessionId.slice(0, 8)}…` : '';
       const queued = pendingMessages.has(a) ? '📨 有排队消息' : '';
-      const details = [pid, cost, turns, session, queued].filter(Boolean).join(' ');
+      const scheduledCount = getScheduledJobCount(a);
+      const scheduled = scheduledCount > 0 ? `⏰ ${scheduledCount}个定时` : '';
+      const details = [pid, cost, turns, session, queued, scheduled].filter(Boolean).join(' ');
       lines.push(`${flag} ${a} (${info.path})${details ? ' — ' + details : ''}`);
     }
     return { text: lines.join('\n') };
+  }
+
+  if (cmd === '/scheduled') {
+    const target = arg || alias;
+    const proj = pm.getProject(target);
+    if (!proj) return { text: `错误: 未知项目 ${target}` };
+
+    const jobs = listScheduledJobs(target);
+    if (jobs.length === 0) {
+      return { text: `项目 ${target} 当前没有待发送的定时任务。` };
+    }
+    const lines = [`项目 ${target} 的定时任务 (${jobs.length}):`];
+    for (const j of jobs) {
+      lines.push(`- ${j.jobId.slice(0, 8)}… | ${j.hours}小时${j.minutes}分钟后 | 触发: ${formatLocalDateTime(j.runAt)} | ${truncate(j.text, 80)}`);
+    }
+    lines.push('');
+    lines.push('撤回示例: /unschedule <任务ID前缀> ' + target);
+    return { text: lines.join('\n') };
+  }
+
+  if (cmd === '/unschedule') {
+    const idOrAll = parts[1] || '';
+    const target = parts[2] || alias;
+    const proj = pm.getProject(target);
+    if (!proj) return { text: `错误: 未知项目 ${target}` };
+
+    if (!idOrAll) {
+      return { text: '用法: /unschedule <任务ID前缀> [alias]\n或: /unschedule all [alias]' };
+    }
+
+    if (idOrAll.toLowerCase() === 'all') {
+      const count = cancelAllScheduledJobs(target);
+      return { text: count > 0 ? `已撤回项目 ${target} 的 ${count} 个定时任务。` : `项目 ${target} 当前没有待发送的定时任务。` };
+    }
+
+    const canceled = cancelScheduledJobById(target, idOrAll);
+    if (!canceled.ok) return { text: `错误: ${canceled.error}` };
+
+    return {
+      text: [
+        '✅ 已撤回定时任务',
+        `项目: ${target}`,
+        `任务: ${canceled.jobId.slice(0, 8)}…`,
+        `原计划: ${formatLocalDateTime(canceled.job.runAt)}`,
+        `消息: ${canceled.job.text}`,
+      ].join('\n'),
+    };
   }
 
   if (cmd === '/start') {
@@ -1579,6 +1686,121 @@ async function handleSlashCommand(pm, alias, text) {
 // ─── Message queue (single-slot per project) ─────────────────────
 
 const pendingMessages = new Map(); // alias → { text, chatId, larkClient, thresholdMs }
+const scheduledMessages = new Map(); // alias → Map<jobId, { timer, chatId, text, runAt, thresholdMs }>
+
+function clearScheduledJob(alias, jobId) {
+  const jobs = scheduledMessages.get(alias);
+  if (!jobs) return;
+  jobs.delete(jobId);
+  if (jobs.size === 0) scheduledMessages.delete(alias);
+}
+
+function getScheduledJobCount(alias) {
+  return scheduledMessages.get(alias)?.size || 0;
+}
+
+function listScheduledJobs(alias) {
+  const jobs = scheduledMessages.get(alias);
+  if (!jobs || jobs.size === 0) return [];
+  return [...jobs.entries()]
+    .map(([jobId, job]) => ({ jobId, ...job }))
+    .sort((a, b) => new Date(a.runAt).getTime() - new Date(b.runAt).getTime());
+}
+
+function cancelAllScheduledJobs(alias) {
+  const jobs = scheduledMessages.get(alias);
+  if (!jobs || jobs.size === 0) return 0;
+  let count = 0;
+  for (const [jobId, job] of jobs) {
+    try { clearTimeout(job.timer); } catch {}
+    clearScheduledJob(alias, jobId);
+    count++;
+  }
+  return count;
+}
+
+function cancelScheduledJobById(alias, idOrPrefix) {
+  const jobs = scheduledMessages.get(alias);
+  if (!jobs || jobs.size === 0) {
+    return { ok: false, error: '当前没有待发送的定时任务。' };
+  }
+  const key = String(idOrPrefix || '').trim();
+  if (!key) {
+    return { ok: false, error: '请提供任务 ID（可用前缀），例如 /unschedule a1b2c3d4' };
+  }
+
+  const matches = [...jobs.entries()].filter(([jobId]) => jobId === key || jobId.startsWith(key));
+  if (matches.length === 0) {
+    return { ok: false, error: `未找到任务: ${key}` };
+  }
+  if (matches.length > 1) {
+    return { ok: false, error: `匹配到多个任务，请提供更长 ID 前缀: ${key}` };
+  }
+
+  const [jobId, job] = matches[0];
+  try { clearTimeout(job.timer); } catch {}
+  clearScheduledJob(alias, jobId);
+  return { ok: true, jobId, job };
+}
+
+function scheduleOneOffMessage(pm, alias, chatId, larkClient, thresholdMs, payload) {
+  const runAt = computeDelayScheduleTime(payload.hours, payload.minutes);
+  const delayMs = Math.max(0, runAt.getTime() - Date.now());
+  const jobId = uuid();
+
+  const timer = setTimeout(() => {
+    void (async () => {
+      clearScheduledJob(alias, jobId);
+
+      const proj = pm.getProject(alias);
+      if (!proj?.started) {
+        try {
+          await sendText(
+            larkClient,
+            chatId,
+            `⏰ 定时消息未发送：项目 ${alias} 未启动。\n消息内容：${payload.text}`,
+          );
+        } catch {}
+        return;
+      }
+
+      const had = pendingMessages.has(alias);
+      pendingMessages.set(alias, {
+        text: payload.text,
+        chatId,
+        larkClient,
+        thresholdMs,
+      });
+
+      if (proj.claude.info().status === 'busy') {
+        let note = '⏰ 定时消息已到点，已加入队列。';
+        if (had) note += '\n（已替换之前排队的消息）';
+        try { await sendText(larkClient, chatId, note); } catch {}
+        return;
+      }
+
+      await drainQueue(pm, alias);
+    })();
+  }, delayMs);
+  if (typeof timer.unref === 'function') timer.unref();
+
+  let jobs = scheduledMessages.get(alias);
+  if (!jobs) {
+    jobs = new Map();
+    scheduledMessages.set(alias, jobs);
+  }
+  jobs.set(jobId, {
+    timer,
+    chatId,
+    text: payload.text,
+    hours: payload.hours,
+    minutes: payload.minutes,
+    runAt: runAt.toISOString(),
+    thresholdMs,
+  });
+
+  return { jobId, runAt };
+}
 
 async function sendReplyToFeishu(larkClient, chatId, replyText, placeholderId) {
   const parsed = parseMediaLines(replyText);
@@ -1644,13 +1866,15 @@ async function sendReplyToFeishu(larkClient, chatId, replyText, placeholderId) {
 }
 
 async function drainQueue(pm, alias) {
+  const proj = pm.getProject(alias);
+  if (!proj?.started) return;
+  if (proj.claude.info().status === 'busy') return;
+
   const entry = pendingMessages.get(alias);
   if (!entry) return;
   pendingMessages.delete(alias);
 
   const { text, chatId, larkClient, thresholdMs } = entry;
-  const proj = pm.getProject(alias);
-  if (!proj?.started) return;
 
   let placeholderId = '';
   let done = false;
@@ -1768,24 +1992,56 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
           const isSlash = trimmed.startsWith('/') && attachments.length === 0;
 
           if (isSlash) {
-            const r = await handleSlashCommand(pm, alias, trimmed);
-            if (r) {
-              replyText = String(r.text ?? '');
+            if (isLegacyClockScheduleCommand(trimmed)) {
+              replyText = '定时语法已更新：请使用 /xx-dd 消息\n例如: /2-15 两小时十五分钟后发送';
             } else {
-              // Unknown slash command — pass through to Claude Code
-              const proj = pm.getProject(alias);
-              if (!proj || !proj.started) {
-                replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
-              } else if (proj.claude.info().status === 'busy') {
-                const had = pendingMessages.has(alias);
-                pendingMessages.set(alias, { text: trimmed, chatId, larkClient, thresholdMs });
-                replyText = '⏳ Claude 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
-                if (had) replyText += '\n（已替换之前排队的消息）';
-                queued = true;
+              const scheduleCmd = parseDelayedSendCommand(trimmed);
+              if (scheduleCmd) {
+                if ('error' in scheduleCmd) {
+                  replyText = `错误: ${scheduleCmd.error}`;
+                } else {
+                  const proj = pm.getProject(alias);
+                  if (!proj || !proj.started) {
+                    replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
+                  } else {
+                    const scheduled = scheduleOneOffMessage(
+                      pm,
+                      alias,
+                      chatId,
+                      larkClient,
+                      thresholdMs,
+                      scheduleCmd,
+                    );
+                    replyText = [
+                      '⏰ 已设置定时发送（一次）',
+                      `延迟: ${scheduleCmd.hours}小时 ${scheduleCmd.minutes}分钟`,
+                      `计划时间: ${formatLocalDateTime(scheduled.runAt)}`,
+                      `消息: ${scheduleCmd.text}`,
+                      `任务: ${scheduled.jobId.slice(0, 8)}…`,
+                    ].join('\n');
+                  }
+                }
               } else {
-                const result = await proj.claude.sendMessage(trimmed);
-                replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
-                if (!replyText.trim()) replyText = `✅ ${trimmed.split(/\s/)[0]} 已执行`;
+                const r = await handleSlashCommand(pm, alias, trimmed);
+                if (r) {
+                  replyText = String(r.text ?? '');
+                } else {
+                  // Unknown slash command — pass through to Claude Code
+                  const proj = pm.getProject(alias);
+                  if (!proj || !proj.started) {
+                    replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
+                  } else if (proj.claude.info().status === 'busy') {
+                    const had = pendingMessages.has(alias);
+                    pendingMessages.set(alias, { text: trimmed, chatId, larkClient, thresholdMs });
+                    replyText = '⏳ Claude 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
+                    if (had) replyText += '\n（已替换之前排队的消息）';
+                    queued = true;
+                  } else {
+                    const result = await proj.claude.sendMessage(trimmed);
+                    replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
+                    if (!replyText.trim()) replyText = `✅ ${trimmed.split(/\s/)[0]} 已执行`;
+                  }
+                }
               }
             }
           } else {
@@ -1899,6 +2155,27 @@ async function runSelfTest() {
   } else {
     console.log('[SKIP] ~/.codes/bridge.json not found');
   }
+
+  // 8) delayed-send command parsing
+  const s1 = parseDelayedSendCommand('/2-30 两小时后同步');
+  ok('delayed parse valid', s1 && !('error' in s1) && s1.hours === 2 && s1.minutes === 30 && s1.text === '两小时后同步');
+  const s2 = parseDelayedSendCommand('/1000-10 hi');
+  ok('delayed parse invalid hour', s2 && 'error' in s2);
+  const s3 = parseDelayedSendCommand('/1-99 hi');
+  ok('delayed parse invalid minute', s3 && 'error' in s3);
+  const s4 = parseDelayedSendCommand('/0-0 hi');
+  ok('delayed parse zero delay', s4 && 'error' in s4);
+  const s5 = parseDelayedSendCommand('/2-30');
+  ok('delayed parse empty body', s5 && 'error' in s5);
+  ok('legacy clock schedule detected', isLegacyClockScheduleCommand('/09:30 hi') === true);
+
+  // 9) delayed schedule time calculation
+  const now1 = new Date('2026-03-05T08:10:20');
+  const n1 = computeDelayScheduleTime(2, 30, now1);
+  ok('delayed time +2h30m', formatLocalDateTime(n1).endsWith('10:40:20'));
+  const now2 = new Date('2026-03-05T23:50:00');
+  const n2 = computeDelayScheduleTime(0, 20, now2);
+  ok('delayed time cross day', n2.getDate() !== now2.getDate() || n2.getMonth() !== now2.getMonth());
 
   console.log('[OK] Selftests finished');
 }
