@@ -26,9 +26,6 @@
 
 同时经过 modified，更加符合中国网络环境。
 
-MCP 部分，需要去 https://jina.ai/ 申请 api key（十分便宜），并编辑 ~/claude.json
-
-
 ## 架构
 
 ```
@@ -152,6 +149,35 @@ FEISHU_BRIDGE_MAX_INBOUND_FILE_MB=40   # 入站文件大小限制
   }
 }
 ```
+
+### mcp的配置
+
+本项目安装部署时，会自动应用 claude_enhance 里面的来自[everything-claude-code](https://github.com/affaan-m/everything-claude-code) —— The performance optimization system for AI agent harnesses. From an Anthropic hackathon winner. 的最佳实践配置，不仅能让你的 claude code 发挥最大能力，还能有效降低 token（通过细腻的分层任务自动切换不同的模型，以及跨 session 的持久记忆）
+
+但是原版的 mcp 过于庞杂，很多也不适合国内环境，因此我精简为五个：github、memory、context7、magic、jina，这五个应该是编程都需要的
+
+其中 github 需要你的 PAT，获取方式为：
+
+```text
+GITHUB_PERSONAL_ACCESS_TOKEN 是在 GitHub 里创建的个人访问令牌（PAT）。
+
+打开 GitHub 的 Token 页面
+https://github.com/settings/personal-access-tokens
+
+选择创建方式
+
+推荐：Fine-grained token（权限更细、更安全）
+兼容旧工具：Tokens (classic)
+按你的 MCP 用途勾权限
+
+只读仓库：Contents: Read
+需要提 Issue / PR：再加 Issues、Pull requests 的 Read and write
+如果 classic token，常见最小是：repo（私有仓库）和 read:org（如需组织信息）
+创建后复制 token 到 .claude.json 的 mcpserver-github 下
+```
+
+jina 需要获取 key，获取地址为：https://jina.ai/ 申请 api key，十分便宜
+
 
 6. 进入 **事件与回调** → **事件配置**：
    - 添加事件：`接收消息 im.message.receive_v1`
