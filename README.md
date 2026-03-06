@@ -4,7 +4,7 @@
 
 <img src="docs/codes.png" alt="codes running demo" style="width: 100%;"/>
 
-即便你是编程老手，其实用这个模式也很有价值，你可以从电脑前彻底解放，随时随地……
+即便你是编程老手，其实用这个模式也很有价值，你可以从电脑前彻底解放，随时随地……搭配上豆包语音输入，打字都不需要了……
 
 # 🌟 与 claude code 原版的 RC（remote control）功能相比
 
