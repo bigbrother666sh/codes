@@ -41,7 +41,7 @@ fi
 info "Phase 1/7: 安装系统依赖..."
 
 sudo apt-get update -qq
-sudo apt-get install -y -qq git curl jq > /dev/null 2>&1
+sudo apt-get install -y -qq git curl jq tmux > /dev/null 2>&1
 ok "系统依赖已安装"
 
 # ─── Phase 2: Node.js ────────────────────────────────────────────
@@ -101,13 +101,12 @@ echo ""
 # --- Claude Code 配置 ---
 echo -e "${BLUE}[1/3] Claude Code API 配置${NC}"
 echo "  你使用的是:"
-echo "    1) Anthropic 官方 API (api.anthropic.com)"
+echo "    1) Anthropic 官方 API"
 echo "    2) 第三方代理 / 自部署 API"
 read -rp "  选择 (1/2) [1]: " API_CHOICE
 API_CHOICE=${API_CHOICE:-1}
 
 if [ "$API_CHOICE" = "1" ]; then
-  ANTHROPIC_BASE_URL="https://api.anthropic.com"
   read -rsp "  请输入 Anthropic API Key: " ANTHROPIC_API_KEY
   echo ""
   ANTHROPIC_AUTH_TOKEN="$ANTHROPIC_API_KEY"
@@ -254,7 +253,7 @@ else
   done
   ok "commands 已安装 (${CMD_COUNT} 个, ${CMD_RENAMED} 个重命名)"
 
-  # 6.5: 安装 skills（���留完整子目录结构）
+  # 6.5: 安装 skills（保留完整子目录结构）
   cp -r "$ENHANCE_DIR/skills/"* "$CLAUDE_DIR/skills/"
   SKILL_COUNT=$(find "$ENHANCE_DIR/skills" -maxdepth 1 -mindepth 1 -type d | wc -l)
   ok "skills 已安装 (${SKILL_COUNT} 个)"

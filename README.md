@@ -49,6 +49,35 @@
 
 ## 快速开始
 
+### 一键部署（Ubuntu 24.04）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bigbrother666sh/codes/main/deploy.sh | bash
+```
+
+脚本会自动安装 Node.js、Claude Code CLI，引导配置飞书凭据，并创建 systemd 服务。
+
+### 备份远端配置
+
+```bash
+git clone https://github.com/bigbrother666sh/codes.git
+cd codes
+./backup.sh <ssh目标> [本地备份目录]
+```
+
+示例：
+
+```bash
+./backup.sh incu
+./backup.sh wukong@123.60.18.144 ./backups
+```
+
+会下载以下内容到本地时间戳目录：
+- `~/.codes`（排除 `logs/` 和 `bridge-sessions.json`）
+- `~/.claude.json`
+- `~/.claude/settings.json`
+- `~/.claude/projects/*/memory`
+
 ### 1. 克隆仓库
 
 ```bash
@@ -214,6 +243,7 @@ curl -fsSL https://raw.githubusercontent.com/bigbrother666sh/codes/main/deploy.s
 ```
 
 脚本会自动安装 Node.js、Claude Code CLI，引导配置飞书凭据，并创建 systemd 服务。
+第一次安装会自动配置 systemd 服务，后面会开启自启。
 
 ### mcp的配置
 

@@ -5,4 +5,4 @@ bridge/bridge.json
 
 .DS_Store
 *.log
-.serena/
+backups/
