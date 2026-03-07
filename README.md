@@ -8,6 +8,8 @@
 
 # 🌟 与 claude code 原版的 RC（remote control）功能相比
 
+🚀【2026.3.7】新增：每日自动备份，bridge 在指定时间自动将配置和会话记忆打包备份到本地，支持 `/backup` 命令随时手动触发
+
 🚀【2026.3.5】新增：延迟消息（计划消息），`/小时-分钟 “要延迟发送的消息”` （xx 小时 xxx 分钟后，内容发给 claude code）
 
 - 不需要 max/pro 订阅；
@@ -137,6 +139,39 @@ node bridge.mjs
 | `thinkingThresholdMs` | thinking 状态提示阈值（ms） | 2500 |
 | `claudePath` | Claude CLI 路径 | `"claude"` |
 | `debug` | 调试模式 | `false` |
+| `backup.time` | 每日自动备份时间（HH:MM） | `"04:16"` |
+| `backup.dest` | 备份目标目录 | `"~/Backups"` |
+| `backup` | 设为 `false` 可完全禁用自动备份 | — |
+
+### 自动备份
+
+bridge 内置每日定时备份，默认凌晨 04:16 将以下内容打包为 `backup_YYYYMMDD_HHmm.tar.gz`：
+
+- `~/.codes`（排除 `logs/` 和 `bridge-sessions.json`）
+- `~/.claude.json`
+- `~/.claude/settings.json`
+- `~/.claude/projects/*/memory`（跨项目记忆）
+
+在 `bridge.json` 中配置：
+
+```json
+{
+  "backup": {
+    "time": "04:16",
+    "dest": "~/Backups"
+  }
+}
+```
+
+设为 `false` 可完全禁用：
+
+```json
+{
+  "backup": false
+}
+```
+
+也可在飞书发 `/backup` 随时手动触发一次。
 
 ### .env 调优（可选）
 
@@ -202,6 +237,7 @@ FEISHU_BRIDGE_MAX_INBOUND_FILE_MB=40   # 入站文件大小限制
 | `/cost [alias]` | 查看费用统计 |
 | `/context [alias]` | 查看会话信息 |
 | `/status` | 查看所有项目状态 |
+| `/backup` | 立即触发一次备份 |
 | `/help` | 显示帮助 |
 
 其他 `/` 开头的消息会直接转发给 Claude Code（如 Claude 内置的 `/compact` 等）。

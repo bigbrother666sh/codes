@@ -107,9 +107,9 @@ read -rp "  选择 (1/2) [1]: " API_CHOICE
 API_CHOICE=${API_CHOICE:-1}
 
 if [ "$API_CHOICE" = "1" ]; then
-  read -rsp "  请输入 Anthropic API Key: " ANTHROPIC_API_KEY
+  read -rsp "  请输入 Anthropic Auth Token (ANTHROPIC_AUTH_TOKEN): " ANTHROPIC_AUTH_TOKEN
   echo ""
-  ANTHROPIC_AUTH_TOKEN="$ANTHROPIC_API_KEY"
+  ANTHROPIC_BASE_URL=""
 else
   read -rp "  请输入 API Base URL: " ANTHROPIC_BASE_URL
   read -rsp "  请输入 Auth Token: " ANTHROPIC_AUTH_TOKEN
@@ -178,27 +178,29 @@ SETTINGSEOF
   ok "已创建最小 Claude Code 配置"
 
   warn "请确保设置 Claude Code 的 API 凭据:"
-  echo "  export ANTHROPIC_BASE_URL=\"${ANTHROPIC_BASE_URL}\""
-  echo "  export ANTHROPIC_API_KEY=\"${ANTHROPIC_AUTH_TOKEN}\""
+  if [ -n "$ANTHROPIC_BASE_URL" ]; then
+    echo "  export ANTHROPIC_BASE_URL=\"${ANTHROPIC_BASE_URL}\""
+  fi
+  echo "  export ANTHROPIC_AUTH_TOKEN=\"${ANTHROPIC_AUTH_TOKEN}\""
   echo ""
   echo "  建议写入 ~/.profile 或 ~/.bashrc"
 fi
 
 # 写入 bridge.env（供 systemd 服务读取）
-cat > "$HOME/.codes/bridge.env" << ENVEOF
-ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}
-ANTHROPIC_API_KEY=${ANTHROPIC_AUTH_TOKEN}
-ENVEOF
+{
+  [ -n "$ANTHROPIC_BASE_URL" ] && echo "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}"
+  echo "ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}"
+} > "$HOME/.codes/bridge.env"
 chmod 600 "$HOME/.codes/bridge.env"
 ok "API 环境变量已写入 ~/.codes/bridge.env"
 
 # 同时写入 ~/.bashrc（供 SSH 登录后手动使用 claude 命令）
-if ! grep -q 'ANTHROPIC_BASE_URL' "$HOME/.bashrc" 2>/dev/null; then
+if ! grep -q 'ANTHROPIC_AUTH_TOKEN' "$HOME/.bashrc" 2>/dev/null; then
   {
     echo ""
     echo "# Claude Code API"
-    echo "export ANTHROPIC_BASE_URL=\"${ANTHROPIC_BASE_URL}\""
-    echo "export ANTHROPIC_API_KEY=\"${ANTHROPIC_AUTH_TOKEN}\""
+    [ -n "$ANTHROPIC_BASE_URL" ] && echo "export ANTHROPIC_BASE_URL=\"${ANTHROPIC_BASE_URL}\""
+    echo "export ANTHROPIC_AUTH_TOKEN=\"${ANTHROPIC_AUTH_TOKEN}\""
   } >> "$HOME/.bashrc"
   ok "API 环境变量已写入 ~/.bashrc"
 fi
