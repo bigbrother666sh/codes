@@ -17,5 +17,9 @@
   },
   "thinkingThresholdMs": 2500,
   "claudePath": "claude",
-  "debug": false
+  "debug": false,
+  "backup": {
+    "time": "04:16",
+    "dest": "~/Backups"
+  }
 }

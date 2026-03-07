@@ -290,6 +290,15 @@ function scheduleCleanup(filePath, minutes = INBOUND_FILE_TTL_MIN) {
   if (typeof t.unref === 'function') t.unref();
 }
 
+/** Returns milliseconds until the next daily occurrence of HH:MM (local time). */
+function msUntilDailyTime(hour, minute) {
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(hour, minute, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+  return next.getTime() - now.getTime();
+}
+
 function looksLikeMediaRef(s) {
   const v = String(s || '').trim();
   if (!v) return false;
@@ -812,6 +821,30 @@ function loadBridgeConfig() {
     proj.feishu.appSecretPath = resolvePath(proj.feishu.appSecretPath);
   }
 
+  // Backup config (optional — set to false to disable)
+  let backup;
+  if (raw.backup === false) {
+    backup = null;
+  } else {
+    const timeStr = String(raw.backup?.time ?? '04:16');
+    const m = timeStr.match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) {
+      console.error(`[FATAL] backup.time 格式无效（应为 HH:MM）: ${timeStr}`);
+      process.exit(1);
+    }
+    const hour = Number(m[1]);
+    const minute = Number(m[2]);
+    if (hour > 23 || minute > 59) {
+      console.error(`[FATAL] backup.time 超出范围: ${timeStr}`);
+      process.exit(1);
+    }
+    backup = {
+      hour,
+      minute,
+      dest: resolvePath(String(raw.backup?.dest ?? '~/Backups')),
+    };
+  }
+
   return {
     projects,
     thinkingThresholdMs: Number(
@@ -819,6 +852,7 @@ function loadBridgeConfig() {
     ),
     claudePath: raw.claudePath || 'claude',
     debug: raw.debug === true || DEBUG,
+    backup,
   };
 }
 
@@ -859,6 +893,8 @@ class ProjectManager {
     // Auto-save sessions every 60s
     this._saveInterval = setInterval(() => this._saveSessions(), 60_000);
     if (this._saveInterval.unref) this._saveInterval.unref();
+
+    this._scheduleBackup();
 
     // Save on process exit, kill all subprocesses
     const saveAndExit = async () => {
@@ -942,6 +978,100 @@ class ProjectManager {
       }
     } catch {}
     return {};
+  }
+
+  _scheduleBackup() {
+    const backup = this._config.backup;
+    if (!backup) return;
+
+    const { hour, minute, dest } = backup;
+    const delay = msUntilDailyTime(hour, minute);
+    const nextRun = new Date(Date.now() + delay);
+    console.log(
+      `[BACKUP] 已调度每日备份 ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}，` +
+      `下次执行: ${formatLocalDateTime(nextRun.toISOString())}，目标: ${dest}`,
+    );
+
+    this._backupTimer = setTimeout(async () => {
+      await this._runBackup(dest);
+      this._scheduleBackup(); // 次日同一时间再次执行
+    }, delay);
+    if (this._backupTimer.unref) this._backupTimer.unref();
+  }
+
+  async _runBackup(dest) {
+    const home = os.homedir();
+    try {
+      fs.mkdirSync(dest, { recursive: true });
+    } catch (e) {
+      console.error(`[BACKUP] 无法创建目标目录 ${dest}: ${e?.message || String(e)}`);
+      return { ok: false, error: String(e?.message || e) };
+    }
+
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/[-:]/g, '')
+      .replace('T', '_')
+      .slice(0, 15);
+    const outFile = path.join(dest, `backup_${timestamp}.tar.gz`);
+
+    // Collect targets (mirrors backup.sh logic, but local — no SSH needed)
+    const targets = [];
+    if (fs.existsSync(path.join(home, '.codes'))) targets.push('.codes');
+    if (fs.existsSync(path.join(home, '.claude.json'))) targets.push('.claude.json');
+    if (fs.existsSync(path.join(home, '.claude', 'settings.json'))) targets.push('.claude/settings.json');
+
+    const projectsDir = path.join(home, '.claude', 'projects');
+    if (fs.existsSync(projectsDir)) {
+      for (const proj of fs.readdirSync(projectsDir).sort()) {
+        const memDir = path.join(projectsDir, proj, 'memory');
+        if (fs.existsSync(memDir)) {
+          targets.push(path.posix.join('.claude', 'projects', proj, 'memory'));
+        }
+      }
+    }
+
+    if (targets.length === 0) {
+      console.warn('[BACKUP] 无可备份内容，已跳过');
+      return { ok: false, error: '无可备份内容' };
+    }
+
+    console.log(`[BACKUP] 开始备份 → ${outFile}`);
+
+    return new Promise((resolve) => {
+      const args = [
+        '-C', home,
+        '--exclude=.codes/logs',
+        '--exclude=.codes/logs/*',
+        '--exclude=.codes/bridge-sessions.json',
+        '-czf', outFile,
+        ...targets,
+      ];
+
+      const proc = spawn('tar', args);
+      let stderr = '';
+      proc.stderr.on('data', (d) => { stderr += d.toString(); });
+      proc.on('close', (code) => {
+        if (code === 0) {
+          try {
+            const stat = fs.statSync(outFile);
+            const sizeMb = (stat.size / 1024 / 1024).toFixed(2);
+            console.log(`[BACKUP] 完成: ${outFile} (${sizeMb} MB)`);
+            resolve({ ok: true, file: outFile, sizeBytes: stat.size });
+          } catch (e) {
+            resolve({ ok: true, file: outFile });
+          }
+        } else {
+          console.error(`[BACKUP] 失败 (exit ${code}): ${stderr.trim()}`);
+          try { fs.unlinkSync(outFile); } catch {}
+          resolve({ ok: false, error: stderr.trim() || `exit ${code}` });
+        }
+      });
+      proc.on('error', (e) => {
+        console.error(`[BACKUP] 无法启动 tar: ${e.message}`);
+        resolve({ ok: false, error: e.message });
+      });
+    });
   }
 
   _saveSessions() {
@@ -1528,10 +1658,11 @@ async function handleSlashCommand(pm, alias, text) {
         '/stop [alias|all]   — 停止项目的 Claude Code',
         '/reset [alias]      — 重置会话（清除历史，开始新对话）',
         '/clear [alias]      — 同 /reset',
-        '/interrupt [alias]  — 打断当前正在处理的消息',
+        '/interrupt [alias]  — 打断当前正在处理���消息',
         '/cost [alias]       — 查看费用（忙碌时显示 bridge 记录）',
         '/context [alias]    — 查看会话信息（忙碌时显示 bridge 记录）',
         '/status             — 查看所有项目状态',
+        '/backup             — 立即触发一次备份',
         '/xx-dd 消息         — xx小时dd分钟后自动发送（一次）',
         '/scheduled [alias]  — 查看待发送定时任务',
         '/unschedule <id> [alias] — 撤回一个定时任务（支持 ID 前缀）',
@@ -1545,6 +1676,19 @@ async function handleSlashCommand(pm, alias, text) {
         `所有项目: ${pm.aliases().join(', ')}`,
       ].join('\n'),
     };
+  }
+
+  if (cmd === '/backup') {
+    const backup = pm._config.backup;
+    if (!backup) {
+      return { text: '备份未启用（bridge.json 中 backup 设为 false）。' };
+    }
+    const result = await pm._runBackup(backup.dest);
+    if (result.ok) {
+      const sizeMb = result.sizeBytes ? ` (${(result.sizeBytes / 1024 / 1024).toFixed(2)} MB)` : '';
+      return { text: `✅ 备份完成${sizeMb}\n路径: ${result.file}` };
+    }
+    return { text: `❌ 备份失败: ${result.error}` };
   }
 
   if (cmd === '/status') {
