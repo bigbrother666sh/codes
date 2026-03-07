@@ -1910,6 +1910,7 @@ function restoreScheduledMessages(pm, larkClientMap, thresholdMs) {
             try { await sendText(larkClient, chatId, note); } catch {}
             return;
           }
+          try { await sendText(larkClient, chatId, `⏰ 定时消息已发送：${text}`); } catch {}
           await drainQueue(pm, alias);
         })();
       }, delayMs);
@@ -2019,6 +2020,7 @@ function scheduleOneOffMessage(pm, alias, chatId, larkClient, thresholdMs, paylo
         return;
       }
 
+      try { await sendText(larkClient, chatId, `⏰ 定时消息已发送：${payload.text}`); } catch {}
       await drainQueue(pm, alias);
     })();
   }, delayMs);
