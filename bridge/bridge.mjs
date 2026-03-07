@@ -91,6 +91,8 @@ const MAX_INBOUND_FILE_MB = Number(process.env.FEISHU_BRIDGE_MAX_INBOUND_FILE_MB
 const INBOUND_FILE_TTL_MIN = Number(process.env.FEISHU_BRIDGE_INBOUND_FILE_TTL_MIN ?? 60);
 const MAX_ATTACHMENTS = Number(process.env.FEISHU_BRIDGE_MAX_ATTACHMENTS ?? 4);
 const PROGRESS_UPDATE_INTERVAL_MS = Number(process.env.FEISHU_BRIDGE_PROGRESS_INTERVAL_MS ?? 15000);
+// Feishu limits message edits to 20 per message; refresh placeholder proactively before hitting the cap.
+const FEISHU_MSG_EDIT_LIMIT = 18;
 
 const SELFTEST = process.argv.includes('--selftest') || process.env.FEISHU_BRIDGE_SELFTEST === '1';
 let DEBUG = process.env.FEISHU_BRIDGE_DEBUG === '1';
@@ -2118,6 +2120,7 @@ async function drainQueue(pm, alias) {
   const { text, chatId, larkClient, thresholdMs } = entry;
 
   let placeholderId = '';
+  let editCount = 0;
   let done = false;
   let progressInterval = null;
 
@@ -2127,21 +2130,32 @@ async function drainQueue(pm, alias) {
         try {
           const res = await sendText(larkClient, chatId, '正在思考…');
           placeholderId = res?.data?.message_id || '';
+          editCount = 0;
           if (placeholderId && PROGRESS_UPDATE_INTERVAL_MS > 0) {
             progressInterval = setInterval(async () => {
               if (done || !placeholderId) { clearInterval(progressInterval); return; }
               const progress = proj.claude.progressText();
               if (progress) {
-                try {
-                  await updateTextMessage(larkClient, placeholderId, progress);
-                } catch {
-                  // Feishu only allows editing messages within 5 minutes of sending.
-                  // When the window expires, send a new placeholder and keep updating it.
+                if (editCount >= FEISHU_MSG_EDIT_LIMIT) {
+                  // Proactively refresh before hitting Feishu's 20-edit-per-message cap.
                   try {
                     const res = await sendText(larkClient, chatId, progress);
                     placeholderId = res?.data?.message_id || '';
+                    editCount = 0;
                     if (!placeholderId) clearInterval(progressInterval);
                   } catch { clearInterval(progressInterval); }
+                } else {
+                  try {
+                    await updateTextMessage(larkClient, placeholderId, progress);
+                    editCount++;
+                  } catch {
+                    try {
+                      const res = await sendText(larkClient, chatId, progress);
+                      placeholderId = res?.data?.message_id || '';
+                      editCount = 0;
+                      if (!placeholderId) clearInterval(progressInterval);
+                    } catch { clearInterval(progressInterval); }
+                  }
                 }
               }
             }, PROGRESS_UPDATE_INTERVAL_MS);
@@ -2210,6 +2224,7 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
       // Process asynchronously
       setImmediate(async () => {
         let placeholderId = '';
+        let editCount = 0;
         let done = false;
         let progressInterval = null;
 
@@ -2220,22 +2235,33 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
                 try {
                   const res = await sendText(larkClient, chatId, '正在思考…');
                   placeholderId = res?.data?.message_id || '';
+                  editCount = 0;
                   if (placeholderId && PROGRESS_UPDATE_INTERVAL_MS > 0) {
                     progressInterval = setInterval(async () => {
                       if (done || !placeholderId) { clearInterval(progressInterval); return; }
                       const proj = pm.getProject(alias);
                       const progress = proj?.claude?.progressText();
                       if (progress) {
-                        try {
-                          await updateTextMessage(larkClient, placeholderId, progress);
-                        } catch {
-                          // Feishu only allows editing messages within 5 minutes of sending.
-                          // When the window expires, send a new placeholder and keep updating it.
+                        if (editCount >= FEISHU_MSG_EDIT_LIMIT) {
+                          // Proactively refresh before hitting Feishu's 20-edit-per-message cap.
                           try {
                             const res = await sendText(larkClient, chatId, progress);
                             placeholderId = res?.data?.message_id || '';
+                            editCount = 0;
                             if (!placeholderId) clearInterval(progressInterval);
                           } catch { clearInterval(progressInterval); }
+                        } else {
+                          try {
+                            await updateTextMessage(larkClient, placeholderId, progress);
+                            editCount++;
+                          } catch {
+                            try {
+                              const res = await sendText(larkClient, chatId, progress);
+                              placeholderId = res?.data?.message_id || '';
+                              editCount = 0;
+                              if (!placeholderId) clearInterval(progressInterval);
+                            } catch { clearInterval(progressInterval); }
+                          }
                         }
                       }
                     }, PROGRESS_UPDATE_INTERVAL_MS);

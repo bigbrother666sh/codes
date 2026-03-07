@@ -11,9 +11,6 @@ Feishu-Claude Bridge: 将飞书机器人连接到 Claude Code CLI，通过飞书
 ```bash
 node bridge/bridge.mjs              # 启动 bridge
 node bridge/bridge.mjs --selftest   # 自测模式（验证配置，不连接飞书）
-node bridge/setup-service.mjs       # 生成 systemd/launchd 服务配置
-cd bridge && npm install             # 安装依赖
-cd bridge && npm start               # 同 node bridge.mjs
 ```
 
 ## Architecture
