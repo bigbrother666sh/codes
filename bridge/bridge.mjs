@@ -2035,7 +2035,17 @@ async function drainQueue(pm, alias) {
               if (done || !placeholderId) { clearInterval(progressInterval); return; }
               const progress = proj.claude.progressText();
               if (progress) {
-                try { await updateTextMessage(larkClient, placeholderId, progress); } catch {}
+                try {
+                  await updateTextMessage(larkClient, placeholderId, progress);
+                } catch {
+                  // Feishu only allows editing messages within 5 minutes of sending.
+                  // When the window expires, send a new placeholder and keep updating it.
+                  try {
+                    const res = await sendText(larkClient, chatId, progress);
+                    placeholderId = res?.data?.message_id || '';
+                    if (!placeholderId) clearInterval(progressInterval);
+                  } catch { clearInterval(progressInterval); }
+                }
               }
             }, PROGRESS_UPDATE_INTERVAL_MS);
           }
@@ -2119,7 +2129,17 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
                       const proj = pm.getProject(alias);
                       const progress = proj?.claude?.progressText();
                       if (progress) {
-                        try { await updateTextMessage(larkClient, placeholderId, progress); } catch {}
+                        try {
+                          await updateTextMessage(larkClient, placeholderId, progress);
+                        } catch {
+                          // Feishu only allows editing messages within 5 minutes of sending.
+                          // When the window expires, send a new placeholder and keep updating it.
+                          try {
+                            const res = await sendText(larkClient, chatId, progress);
+                            placeholderId = res?.data?.message_id || '';
+                            if (!placeholderId) clearInterval(progressInterval);
+                          } catch { clearInterval(progressInterval); }
+                        }
                       }
                     }, PROGRESS_UPDATE_INTERVAL_MS);
                   }
