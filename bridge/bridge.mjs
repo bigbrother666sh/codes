@@ -859,6 +859,7 @@ function loadBridgeConfig() {
 // ─── ProjectManager ──────────────────────────────────────────────
 
 const SESSIONS_PATH = resolvePath('~/.codes/bridge-sessions.json');
+const SCHEDULED_PATH = resolvePath('~/.codes/bridge-scheduled.json');
 
 class ProjectManager {
   constructor(config) {
@@ -1832,6 +1833,98 @@ async function handleSlashCommand(pm, alias, text) {
 const pendingMessages = new Map(); // alias → { text, chatId, larkClient, thresholdMs }
 const scheduledMessages = new Map(); // alias → Map<jobId, { timer, chatId, text, runAt, thresholdMs }>
 
+function saveScheduledMessages() {
+  try {
+    const data = {};
+    for (const [alias, jobs] of scheduledMessages) {
+      data[alias] = [];
+      for (const [jobId, job] of jobs) {
+        data[alias].push({
+          jobId,
+          chatId: job.chatId,
+          text: job.text,
+          runAt: job.runAt,
+          thresholdMs: job.thresholdMs,
+        });
+      }
+    }
+    fs.mkdirSync(path.dirname(SCHEDULED_PATH), { recursive: true });
+    const tmp = SCHEDULED_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+    fs.renameSync(tmp, SCHEDULED_PATH);
+  } catch (e) {
+    console.error(`[WARN] Failed to save scheduled messages: ${e?.message || String(e)}`);
+  }
+}
+
+function restoreScheduledMessages(pm, larkClientMap, thresholdMs) {
+  if (!fs.existsSync(SCHEDULED_PATH)) return 0;
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(SCHEDULED_PATH, 'utf8'));
+  } catch {
+    return 0;
+  }
+
+  const now = Date.now();
+  let count = 0;
+  for (const [alias, jobs] of Object.entries(data)) {
+    if (!Array.isArray(jobs)) continue;
+    const larkClient = larkClientMap.get(alias);
+    if (!larkClient) continue;
+    for (const job of jobs) {
+      const { jobId, chatId, text, runAt, thresholdMs: jobThresholdMs } = job;
+      if (!jobId || !chatId || !text || !runAt) continue;
+      const runAtMs = new Date(runAt).getTime();
+      if (isNaN(runAtMs)) continue;
+
+      // Already past — fire immediately with a late notice
+      const delayMs = Math.max(0, runAtMs - now);
+      const isLate = runAtMs < now;
+
+      const timer = setTimeout(() => {
+        void (async () => {
+          clearScheduledJob(alias, jobId);
+          saveScheduledMessages();
+
+          if (isLate) {
+            try {
+              await sendText(larkClient, chatId, `⏰ 定时消息（延迟送达，原定 ${formatLocalDateTime(runAt)}）：\n${text}`);
+            } catch {}
+            return;
+          }
+
+          const proj = pm.getProject(alias);
+          if (!proj?.started) {
+            try {
+              await sendText(larkClient, chatId, `⏰ 定时消息未发送：项目 ${alias} 未启动。\n消息内容：${text}`);
+            } catch {}
+            return;
+          }
+
+          const had = pendingMessages.has(alias);
+          pendingMessages.set(alias, { text, chatId, larkClient, thresholdMs: jobThresholdMs ?? thresholdMs });
+          if (proj.claude.info().status === 'busy') {
+            let note = '⏰ 定时消息已到点，已加入队列。';
+            if (had) note += '\n（已替换之前排队的消息）';
+            try { await sendText(larkClient, chatId, note); } catch {}
+            return;
+          }
+          await drainQueue(pm, alias);
+        })();
+      }, delayMs);
+      if (typeof timer.unref === 'function') timer.unref();
+
+      let jobs2 = scheduledMessages.get(alias);
+      if (!jobs2) { jobs2 = new Map(); scheduledMessages.set(alias, jobs2); }
+      jobs2.set(jobId, { timer, chatId, text, runAt, thresholdMs: jobThresholdMs ?? thresholdMs });
+      count++;
+    }
+  }
+  if (count > 0) console.log(`[SCHED] 已恢复 ${count} 条定时消息`);
+  return count;
+}
+
 function clearScheduledJob(alias, jobId) {
   const jobs = scheduledMessages.get(alias);
   if (!jobs) return;
@@ -1860,6 +1953,7 @@ function cancelAllScheduledJobs(alias) {
     clearScheduledJob(alias, jobId);
     count++;
   }
+  saveScheduledMessages();
   return count;
 }
 
@@ -1884,6 +1978,7 @@ function cancelScheduledJobById(alias, idOrPrefix) {
   const [jobId, job] = matches[0];
   try { clearTimeout(job.timer); } catch {}
   clearScheduledJob(alias, jobId);
+  saveScheduledMessages();
   return { ok: true, jobId, job };
 }
 
@@ -1895,6 +1990,7 @@ function scheduleOneOffMessage(pm, alias, chatId, larkClient, thresholdMs, paylo
   const timer = setTimeout(() => {
     void (async () => {
       clearScheduledJob(alias, jobId);
+      saveScheduledMessages();
 
       const proj = pm.getProject(alias);
       if (!proj?.started) {
@@ -1937,11 +2033,10 @@ function scheduleOneOffMessage(pm, alias, chatId, larkClient, thresholdMs, paylo
     timer,
     chatId,
     text: payload.text,
-    hours: payload.hours,
-    minutes: payload.minutes,
     runAt: runAt.toISOString(),
     thresholdMs,
   });
+  saveScheduledMessages();
 
   return { jobId, runAt };
 }
@@ -2358,6 +2453,7 @@ const pm = new ProjectManager(bridgeConfig);
 await pm.init();
 
 // Start one Feishu bot per project
+const larkClientMap = new Map(); // alias → larkClient (for restoring scheduled messages)
 for (const [alias, proj] of Object.entries(bridgeConfig.projects)) {
   const secret = mustRead(proj.feishu.appSecretPath, `Feishu secret for "${alias}"`);
   const sdkConfig = {
@@ -2368,6 +2464,7 @@ for (const [alias, proj] of Object.entries(bridgeConfig.projects)) {
   };
 
   const larkClient = new Lark.Client(sdkConfig);
+  larkClientMap.set(alias, larkClient);
   const wsClient = new Lark.WSClient({ ...sdkConfig, loggerLevel: Lark.LoggerLevel.info });
 
   const dispatcher = new Lark.EventDispatcher({}).register({
@@ -2382,6 +2479,8 @@ for (const [alias, proj] of Object.entries(bridgeConfig.projects)) {
   wsClient.start({ eventDispatcher: dispatcher });
   console.log(`[OK] Bot started: "${alias}" (appId=${proj.feishu.appId}, path=${proj.path})`);
 }
+
+restoreScheduledMessages(pm, larkClientMap, bridgeConfig.thinkingThresholdMs);
 
 console.log(`[OK] Feishu bridge v${BRIDGE_VERSION} started — ${Object.keys(bridgeConfig.projects).length} project(s)`);
 console.log(`[OK] Allowed local media dirs: ${ALLOWED_LOCAL_MEDIA_DIRS.join(', ') || '(none)'}`);
