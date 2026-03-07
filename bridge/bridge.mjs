@@ -497,10 +497,11 @@ class ClaudeProcess {
   /**
    * @param {{ workDir: string, claudePath?: string, sessionId?: string|null }} opts
    */
-  constructor({ workDir, claudePath = 'claude', sessionId = null }) {
+  constructor({ workDir, claudePath = 'claude', sessionId = null, model = null }) {
     this._workDir = workDir;
     this._claudePath = claudePath;
     this._sessionId = sessionId;
+    this._model = model;          // null = use CLI default
     this._process = null;
     this._stdin = null;
     this._costUsd = 0;
@@ -524,6 +525,9 @@ class ClaudeProcess {
     ];
     if (this._sessionId) {
       args.push('--resume', this._sessionId);
+    }
+    if (this._model) {
+      args.push('--model', this._model);
     }
 
     const proc = spawn(this._claudePath, args, {
@@ -752,6 +756,7 @@ class ClaudeProcess {
       sessionId: this._sessionId || null,
       costUsd: Math.round(this._costUsd * 10000) / 10000,
       turnCount: this._turnCount,
+      model: this._model || null,
     };
   }
 
@@ -1666,6 +1671,7 @@ async function handleSlashCommand(pm, alias, text) {
         '/context [alias]    — 查看会话信息（忙碌时显示 bridge 记录）',
         '/status             — 查看所有项目状态',
         '/backup             — 立即触发一次备份',
+        '/model [名称] [alias] — 查看或切换模型（opus/sonnet/haiku 或完整模型名）',
         '/xx-dd 消息         — xx小时dd分钟后自动发送（一次）',
         '/scheduled [alias]  — 查看待发送定时任务',
         '/unschedule <id> [alias] — 撤回一个定时任务（支持 ID 前缀）',
@@ -1722,8 +1728,13 @@ async function handleSlashCommand(pm, alias, text) {
       return { text: `项目 ${target} 当前没有待发送的定时任务。` };
     }
     const lines = [`项目 ${target} 的定时任务 (${jobs.length}):`];
+    const nowMs = Date.now();
     for (const j of jobs) {
-      lines.push(`- ${j.jobId.slice(0, 8)}… | ${j.hours}小时${j.minutes}分钟后 | 触发: ${formatLocalDateTime(j.runAt)} | ${truncate(j.text, 80)}`);
+      const remainMs = Math.max(0, new Date(j.runAt).getTime() - nowMs);
+      const remainH = Math.floor(remainMs / 3600000);
+      const remainM = Math.floor((remainMs % 3600000) / 60000);
+      const remainStr = remainMs > 0 ? `还剩 ${remainH}h${remainM}m` : '已到期';
+      lines.push(`- ${j.jobId.slice(0, 8)}… | ${remainStr} | 触发: ${formatLocalDateTime(j.runAt)} | ${truncate(j.text, 80)}`);
     }
     lines.push('');
     lines.push('撤回示例: /unschedule <任务ID前缀> ' + target);
@@ -1824,6 +1835,37 @@ async function handleSlashCommand(pm, alias, text) {
         '(Claude 正在处理消息，详细上下文信息需等待处理完成后查询)',
       ].join('\n'),
     };
+  }
+
+  if (cmd === '/model') {
+    const target = parts[2] || alias;
+    const proj = pm.getProject(target);
+    if (!proj) return { text: `错误: 未知项目 ${target}` };
+
+    if (!arg) {
+      const current = proj.claude.info().model || '(CLI 默认)';
+      return { text: `项目 ${target} 当前模型: ${current}\n用法: /model <模型名> [alias]\n示例: /model opus\n      /model claude-opus-4-5-20251001` };
+    }
+
+    if (proj.claude.info().status === 'busy') {
+      return { text: `项目 ${target} 正在处理消息，请先等待完成或 /interrupt 打断后再切换模型。` };
+    }
+
+    // Normalise shorthand names
+    const modelAliases = {
+      opus: 'claude-opus-4-5-20251001',
+      sonnet: 'claude-sonnet-4-6',
+      haiku: 'claude-haiku-4-5-20251001',
+    };
+    const resolved = modelAliases[arg.toLowerCase()] || arg;
+
+    proj.claude._model = resolved;
+    // Kill current process so it respawns with new --model on next message
+    if (proj.claude._process) {
+      try { proj.claude._process.kill('SIGTERM'); } catch {}
+    }
+
+    return { text: `✅ 项目 ${target} 已切换模型: ${resolved}\n下次消息起生效。` };
   }
 
   // Unknown slash command — pass through to Claude Code as normal message
