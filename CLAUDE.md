@@ -11,6 +11,12 @@ Feishu-Claude Bridge: 将飞书机器人连接到 Claude Code CLI，通过飞书
 ```bash
 node bridge/bridge.mjs              # 启动 bridge
 node bridge/bridge.mjs --selftest   # 自测模式（验证配置，不连接飞书）
+
+# systemd 服务管理（用户级服务）
+systemctl --user restart codes-feishu-bridge.service   # 重启
+systemctl --user status codes-feishu-bridge.service    # 查看状态
+systemctl --user stop codes-feishu-bridge.service      # 停止
+systemctl --user start codes-feishu-bridge.service     # 启动
 ```
 
 ## Architecture
