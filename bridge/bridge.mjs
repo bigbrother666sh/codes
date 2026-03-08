@@ -1666,9 +1666,7 @@ async function handleSlashCommand(pm, alias, text) {
         '/stop [alias|all]   — 停止项目的 Claude Code',
         '/reset [alias]      — 重置会话（清除历史，开始新对话）',
         '/clear [alias]      — 同 /reset',
-        '/interrupt [alias]  — 打断当前正在处理���消息',
-        '/cost [alias]       — 查看费用（忙碌时显示 bridge 记录）',
-        '/context [alias]    — 查看会话信息（忙碌时显示 bridge 记录）',
+        '/interrupt [alias]  — 打断当前正在处理的消息',
         '/status             — 查看所有项目状态',
         '/backup             — 立即触发一次备份',
         '/model [名称] [alias] — 查看或切换模型（opus/sonnet/haiku 或完整模型名）',
@@ -1802,39 +1800,6 @@ async function handleSlashCommand(pm, alias, text) {
     if (!proj?.started) return { text: `项目 ${target} 未启动` };
     const ok = proj.claude.interrupt();
     return { text: ok ? `已发送打断信号给 ${target}` : `${target} 当前没有在处理消息` };
-  }
-
-  // /cost and /context: when busy, return bridge-level info immediately (no queue);
-  // when idle, pass through to Claude Code for full details.
-  if (cmd === '/cost' || cmd === '/context') {
-    const target = arg || alias;
-    const proj = pm.getProject(target);
-    if (!proj?.started) return { text: `项目 ${target} 未启动` };
-
-    const info = proj.claude.info();
-    if (info.status !== 'busy') return null; // idle → passthrough to Claude
-
-    if (cmd === '/cost') {
-      return {
-        text: [
-          `项目 ${target} 费用统计:`,
-          `累计费用: $${info.costUsd}`,
-          `对话轮数: ${info.turnCount}`,
-          '',
-          '(Claude 正在处理消息，显示 bridge 记录的累计数据)',
-        ].join('\n'),
-      };
-    }
-    return {
-      text: [
-        `项目 ${target} 会话信息:`,
-        `Session: ${info.sessionId ? info.sessionId.slice(0, 12) + '…' : '(无)'}`,
-        `PID: ${info.pid || '(未运行)'}`,
-        `状态: ${info.status}`,
-        '',
-        '(Claude 正在处理消息，详细上下文信息需等待处理完成后查询)',
-      ].join('\n'),
-    };
   }
 
   if (cmd === '/model') {
@@ -2210,7 +2175,10 @@ async function drainQueue(pm, alias) {
   try {
     const result = await proj.claude.sendMessage(text);
     replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
-    if (!replyText.trim()) replyText = '✅ 已执行（无输出）';
+    if (!replyText.trim()) {
+      const costNote = result?.costUsd > 0 ? ` ($${result.costUsd})` : '';
+      replyText = `✅ 已执行（无输出）${costNote}`;
+    }
   } catch (e) {
     replyText = `（系统出错）${e?.message || String(e)}`;
   } finally {
@@ -2368,7 +2336,10 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
                   } else {
                     const result = await proj.claude.sendMessage(trimmed);
                     replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
-                    if (!replyText.trim()) replyText = `✅ ${trimmed.split(/\s/)[0]} 已执行`;
+                    if (!replyText.trim()) {
+                      const costNote = result?.costUsd > 0 ? ` ($${result.costUsd})` : '';
+                      replyText = `✅ ${trimmed.split(/\s/)[0]} 已执行${costNote}`;
+                    }
                   }
                 }
               }
@@ -2399,7 +2370,10 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
               } else {
                 const result = await proj.claude.sendMessage(fullText);
                 replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
-                if (!replyText.trim()) replyText = '✅ 已执行（无输出）';
+                if (!replyText.trim()) {
+                  const costNote = result?.costUsd > 0 ? ` ($${result.costUsd})` : '';
+                  replyText = `✅ 已执行（无输出）${costNote}`;
+                }
               }
             }
           }
