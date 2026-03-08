@@ -33,6 +33,15 @@ import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 
+// ─── Console timestamp patch ──────────────────────────────────
+{
+  const ts = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
+  for (const level of ['log', 'error', 'warn', 'info']) {
+    const orig = console[level].bind(console);
+    console[level] = (...args) => orig(`[${ts()}]`, ...args);
+  }
+}
+
 // Load .env automatically (so users don't need to export env vars manually).
 // - Does NOT override existing process.env values.
 // - Keeps this bridge dependency-free (no dotenv package).
