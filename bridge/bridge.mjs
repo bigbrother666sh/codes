@@ -99,9 +99,6 @@ const MAX_INBOUND_IMAGE_MB = Number(process.env.FEISHU_BRIDGE_MAX_INBOUND_IMAGE_
 const MAX_INBOUND_FILE_MB = Number(process.env.FEISHU_BRIDGE_MAX_INBOUND_FILE_MB ?? 40);
 const INBOUND_FILE_TTL_MIN = Number(process.env.FEISHU_BRIDGE_INBOUND_FILE_TTL_MIN ?? 60);
 const MAX_ATTACHMENTS = Number(process.env.FEISHU_BRIDGE_MAX_ATTACHMENTS ?? 4);
-const PROGRESS_UPDATE_INTERVAL_MS = Number(process.env.FEISHU_BRIDGE_PROGRESS_INTERVAL_MS ?? 15000);
-// Feishu limits message edits to 20 per message; refresh placeholder proactively before hitting the cap.
-const FEISHU_MSG_EDIT_LIMIT = 18;
 
 const SELFTEST = process.argv.includes('--selftest') || process.env.FEISHU_BRIDGE_SELFTEST === '1';
 let DEBUG = process.env.FEISHU_BRIDGE_DEBUG === '1';
@@ -1513,15 +1510,83 @@ async function sendText(client, chatId, text) {
   });
 }
 
-async function updateTextMessage(client, messageId, text) {
-  return client.im.v1.message.update({
-    path: { message_id: messageId },
-    data: { msg_type: 'text', content: JSON.stringify({ text }) },
+/**
+ * Build a Feishu interactive card (schema 2.0) with markdown content.
+ * Cards render code blocks, tables, and rich formatting properly in Feishu.
+ */
+function buildMarkdownCard(text) {
+  return {
+    schema: '2.0',
+    config: { wide_screen_mode: true },
+    body: {
+      elements: [{ tag: 'markdown', content: text }],
+    },
+  };
+}
+
+/**
+ * Detect whether text contains markdown features that benefit from card rendering.
+ * Returns true if text has fenced code blocks or markdown tables.
+ */
+function shouldUseMarkdownCard(text) {
+  return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
+}
+
+/**
+ * Send text as an interactive markdown card (interactive message type).
+ * This renders code blocks, tables, bold/italic etc. properly in Feishu.
+ */
+async function sendMarkdownCard(client, chatId, text, replyToMessageId) {
+  const card = buildMarkdownCard(text);
+  const content = JSON.stringify(card);
+
+  if (replyToMessageId) {
+    try {
+      const res = await client.im.v1.message.reply({
+        path: { message_id: replyToMessageId },
+        data: { content, msg_type: 'interactive' },
+      });
+      if (res?.code === 0 || res?.code === undefined) return res;
+      // Fall through to direct send if reply fails
+    } catch {
+      // Fall through to direct send
+    }
+  }
+
+  return client.im.v1.message.create({
+    params: { receive_id_type: 'chat_id' },
+    data: { receive_id: chatId, msg_type: 'interactive', content },
   });
 }
 
-async function deleteMessage(client, messageId) {
-  return client.im.v1.message.delete({ path: { message_id: messageId } });
+
+/**
+ * Add an emoji reaction to a message (used as "typing" indicator).
+ * Returns reactionId on success, or null on failure.
+ */
+async function addReaction(client, messageId, emojiType) {
+  try {
+    const res = await client.im.v1.message.messageReaction.create({
+      path: { message_id: messageId },
+      data: { reaction_type: { emoji_type: emojiType } },
+    });
+    return res?.data?.reaction_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Remove an emoji reaction from a message.
+ */
+async function removeReaction(client, messageId, reactionId) {
+  try {
+    await client.im.v1.message.messageReaction.delete({
+      path: { message_id: messageId, reaction_id: reactionId },
+    });
+  } catch {
+    // Ignore — reaction may have already been removed
+  }
 }
 
 async function uploadAndSendMedia(client, chatId, mediaUrlOrPath, captionText) {
@@ -2061,7 +2126,18 @@ function scheduleOneOffMessage(pm, alias, chatId, larkClient, thresholdMs, paylo
   return { jobId, runAt };
 }
 
-async function sendReplyToFeishu(larkClient, chatId, replyText, placeholderId) {
+/**
+ * Send Claude's reply back to Feishu.
+ * @param {object} replyCtx  - { incomingMessageId, reactionId } for cleaning up the typing indicator
+ */
+async function sendReplyToFeishu(larkClient, chatId, replyText, replyCtx) {
+  const { incomingMessageId, reactionId } = replyCtx || {};
+
+  // Clean up typing indicator reaction first
+  if (incomingMessageId && reactionId) {
+    await removeReaction(larkClient, incomingMessageId, reactionId);
+  }
+
   const parsed = parseMediaLines(replyText);
   replyText = parsed.text;
   let mediaUrls = parsed.mediaUrls || [];
@@ -2079,9 +2155,6 @@ async function sendReplyToFeishu(larkClient, chatId, replyText, placeholderId) {
 
   const trimmedText = (replyText || '').trim();
   if ((!trimmedText || trimmedText === 'NO_REPLY' || trimmedText.endsWith('NO_REPLY')) && mediaUrls.length === 0) {
-    if (placeholderId) {
-      try { await deleteMessage(larkClient, placeholderId); } catch {}
-    }
     return;
   }
 
@@ -2091,10 +2164,6 @@ async function sendReplyToFeishu(larkClient, chatId, replyText, placeholderId) {
 
   try {
     if (mediaUrls.length > 0) {
-      if (placeholderId) {
-        try { await deleteMessage(larkClient, placeholderId); } catch {}
-        placeholderId = '';
-      }
       for (const u of mediaUrls.slice(0, 4)) {
         await uploadAndSendMedia(larkClient, chatId, u, undefined);
       }
@@ -2104,20 +2173,14 @@ async function sendReplyToFeishu(larkClient, chatId, replyText, placeholderId) {
       return;
     }
 
-    if (placeholderId) {
-      try {
-        await updateTextMessage(larkClient, placeholderId, replyText);
-        return;
-      } catch {
-        // fall through
-      }
+    // Auto-detect markdown content: use interactive card for rich rendering
+    if (shouldUseMarkdownCard(replyText)) {
+      await sendMarkdownCard(larkClient, chatId, replyText, incomingMessageId);
+      return;
     }
 
     await sendText(larkClient, chatId, replyText);
   } catch (err) {
-    if (placeholderId) {
-      try { await deleteMessage(larkClient, placeholderId); } catch {}
-    }
     try {
       await sendText(larkClient, chatId, `（发送失败）${err instanceof Error ? err.message : String(err)}`);
     } catch {}
@@ -2133,50 +2196,17 @@ async function drainQueue(pm, alias) {
   if (!entry) return;
   pendingMessages.delete(alias);
 
-  const { text, chatId, larkClient, thresholdMs } = entry;
+  const { text, chatId, larkClient, thresholdMs, incomingMessageId } = entry;
 
-  let placeholderId = '';
-  let editCount = 0;
+  let reactionId = null;
   let done = false;
-  let progressInterval = null;
 
   const timer = thresholdMs > 0
     ? setTimeout(async () => {
         if (done) return;
-        try {
-          const res = await sendText(larkClient, chatId, '正在思考…');
-          placeholderId = res?.data?.message_id || '';
-          editCount = 0;
-          if (placeholderId && PROGRESS_UPDATE_INTERVAL_MS > 0) {
-            progressInterval = setInterval(async () => {
-              if (done || !placeholderId) { clearInterval(progressInterval); return; }
-              const progress = proj.claude.progressText();
-              if (progress) {
-                if (editCount >= FEISHU_MSG_EDIT_LIMIT) {
-                  // Proactively refresh before hitting Feishu's 20-edit-per-message cap.
-                  try {
-                    const res = await sendText(larkClient, chatId, progress);
-                    placeholderId = res?.data?.message_id || '';
-                    editCount = 0;
-                    if (!placeholderId) clearInterval(progressInterval);
-                  } catch { clearInterval(progressInterval); }
-                } else {
-                  try {
-                    await updateTextMessage(larkClient, placeholderId, progress);
-                    editCount++;
-                  } catch {
-                    try {
-                      const res = await sendText(larkClient, chatId, progress);
-                      placeholderId = res?.data?.message_id || '';
-                      editCount = 0;
-                      if (!placeholderId) clearInterval(progressInterval);
-                    } catch { clearInterval(progressInterval); }
-                  }
-                }
-              }
-            }, PROGRESS_UPDATE_INTERVAL_MS);
-          }
-        } catch {}
+        if (incomingMessageId) {
+          reactionId = await addReaction(larkClient, incomingMessageId, 'Typing');
+        }
       }, thresholdMs)
     : null;
 
@@ -2193,10 +2223,9 @@ async function drainQueue(pm, alias) {
   } finally {
     done = true;
     if (timer) clearTimeout(timer);
-    if (progressInterval) clearInterval(progressInterval);
   }
 
-  await sendReplyToFeishu(larkClient, chatId, replyText, placeholderId);
+  await sendReplyToFeishu(larkClient, chatId, replyText, { incomingMessageId, reactionId });
   await drainQueue(pm, alias);
 }
 
@@ -2242,52 +2271,14 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
 
       // Process asynchronously
       setImmediate(async () => {
-        let placeholderId = '';
-        let editCount = 0;
+        let reactionId = null;
         let done = false;
-        let progressInterval = null;
 
         const timer =
           thresholdMs > 0
             ? setTimeout(async () => {
                 if (done) return;
-                try {
-                  const res = await sendText(larkClient, chatId, '正在思考…');
-                  placeholderId = res?.data?.message_id || '';
-                  editCount = 0;
-                  if (placeholderId && PROGRESS_UPDATE_INTERVAL_MS > 0) {
-                    progressInterval = setInterval(async () => {
-                      if (done || !placeholderId) { clearInterval(progressInterval); return; }
-                      const proj = pm.getProject(alias);
-                      const progress = proj?.claude?.progressText();
-                      if (progress) {
-                        if (editCount >= FEISHU_MSG_EDIT_LIMIT) {
-                          // Proactively refresh before hitting Feishu's 20-edit-per-message cap.
-                          try {
-                            const res = await sendText(larkClient, chatId, progress);
-                            placeholderId = res?.data?.message_id || '';
-                            editCount = 0;
-                            if (!placeholderId) clearInterval(progressInterval);
-                          } catch { clearInterval(progressInterval); }
-                        } else {
-                          try {
-                            await updateTextMessage(larkClient, placeholderId, progress);
-                            editCount++;
-                          } catch {
-                            try {
-                              const res = await sendText(larkClient, chatId, progress);
-                              placeholderId = res?.data?.message_id || '';
-                              editCount = 0;
-                              if (!placeholderId) clearInterval(progressInterval);
-                            } catch { clearInterval(progressInterval); }
-                          }
-                        }
-                      }
-                    }, PROGRESS_UPDATE_INTERVAL_MS);
-                  }
-                } catch {
-                  // ignore
-                }
+                reactionId = await addReaction(larkClient, messageId, 'Typing');
               }, thresholdMs)
             : null;
 
@@ -2338,7 +2329,7 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
                     replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
                   } else if (proj.claude.info().status === 'busy') {
                     const had = pendingMessages.has(alias);
-                    pendingMessages.set(alias, { text: trimmed, chatId, larkClient, thresholdMs });
+                    pendingMessages.set(alias, { text: trimmed, chatId, larkClient, thresholdMs, incomingMessageId: messageId });
                     replyText = '⏳ Claude 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
                     if (had) replyText += '\n（已替换之前排队的消息）';
                     queued = true;
@@ -2372,7 +2363,7 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
 
               if (proj.claude.info().status === 'busy') {
                 const had = pendingMessages.has(alias);
-                pendingMessages.set(alias, { text: fullText, chatId, larkClient, thresholdMs });
+                pendingMessages.set(alias, { text: fullText, chatId, larkClient, thresholdMs, incomingMessageId: messageId });
                 replyText = '⏳ Claude 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
                 if (had) replyText += '\n（已替换之前排队的消息）';
                 queued = true;
@@ -2391,10 +2382,9 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
         } finally {
           done = true;
           if (timer) clearTimeout(timer);
-          if (progressInterval) clearInterval(progressInterval);
         }
 
-        await sendReplyToFeishu(larkClient, chatId, replyText, placeholderId);
+        await sendReplyToFeishu(larkClient, chatId, replyText, { incomingMessageId: messageId, reactionId });
 
         if (!queued) {
           await drainQueue(pm, alias);
@@ -2488,6 +2478,15 @@ async function runSelfTest() {
   const now2 = new Date('2026-03-05T23:50:00');
   const n2 = computeDelayScheduleTime(0, 20, now2);
   ok('delayed time cross day', n2.getDate() !== now2.getDate() || n2.getMonth() !== now2.getMonth());
+
+  // 10) markdown card detection
+  ok('card: code block', shouldUseMarkdownCard('```js\nconsole.log(1);\n```') === true);
+  ok('card: table', shouldUseMarkdownCard('| a | b |\n|---|---|\n| 1 | 2 |') === true);
+  ok('card: plain text no card', shouldUseMarkdownCard('hello world') === false);
+  ok('card: build structure', (() => {
+    const card = buildMarkdownCard('test **bold**');
+    return card.schema === '2.0' && card.body.elements[0].tag === 'markdown';
+  })());
 
   console.log('[OK] Selftests finished');
 }
