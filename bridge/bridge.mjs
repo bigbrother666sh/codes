@@ -1526,10 +1526,17 @@ function buildMarkdownCard(text) {
 
 /**
  * Detect whether text contains markdown features that benefit from card rendering.
- * Returns true if text has fenced code blocks or markdown tables.
+ * Returns true if text has fenced code blocks, tables, headings, bold/italic, or lists.
  */
 function shouldUseMarkdownCard(text) {
-  return /```[\s\S]*?```/.test(text) || /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text);
+  return (
+    /```[\s\S]*?```/.test(text) ||          // fenced code block
+    /\|.+\|[\r\n]+\|[-:| ]+\|/.test(text) || // markdown table
+    /\*\*\S/.test(text) ||                  // **bold**
+    /^#{1,6} /m.test(text) ||              // # heading
+    /^[-*] \S/m.test(text) ||              // - bullet list
+    /^\d+\. \S/m.test(text)               // 1. ordered list
+  );
 }
 
 /**
@@ -1566,7 +1573,7 @@ async function sendMarkdownCard(client, chatId, text, replyToMessageId) {
  */
 async function addReaction(client, messageId, emojiType) {
   try {
-    const res = await client.im.v1.message.messageReaction.create({
+    const res = await client.im.messageReaction.create({
       path: { message_id: messageId },
       data: { reaction_type: { emoji_type: emojiType } },
     });
@@ -1581,7 +1588,7 @@ async function addReaction(client, messageId, emojiType) {
  */
 async function removeReaction(client, messageId, reactionId) {
   try {
-    await client.im.v1.message.messageReaction.delete({
+    await client.im.messageReaction.delete({
       path: { message_id: messageId, reaction_id: reactionId },
     });
   } catch {
@@ -2482,6 +2489,10 @@ async function runSelfTest() {
   // 10) markdown card detection
   ok('card: code block', shouldUseMarkdownCard('```js\nconsole.log(1);\n```') === true);
   ok('card: table', shouldUseMarkdownCard('| a | b |\n|---|---|\n| 1 | 2 |') === true);
+  ok('card: bold', shouldUseMarkdownCard('text **bold** here') === true);
+  ok('card: heading', shouldUseMarkdownCard('# Title\nsome text') === true);
+  ok('card: bullet list', shouldUseMarkdownCard('- item one\n- item two') === true);
+  ok('card: ordered list', shouldUseMarkdownCard('1. first\n2. second') === true);
   ok('card: plain text no card', shouldUseMarkdownCard('hello world') === false);
   ok('card: build structure', (() => {
     const card = buildMarkdownCard('test **bold**');
