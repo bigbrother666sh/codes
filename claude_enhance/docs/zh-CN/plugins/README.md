@@ -14,7 +14,7 @@
 # Add official Anthropic marketplace
 claude plugin marketplace add https://github.com/anthropics/claude-plugins-official
 
-# Add community marketplaces
+# Add community marketplaces (mgrep by @mixedbread-ai)
 claude plugin marketplace add https://github.com/mixedbread-ai/mgrep
 ```
 
@@ -24,7 +24,7 @@ claude plugin marketplace add https://github.com/mixedbread-ai/mgrep
 |-------------|--------|
 | claude-plugins-official | `anthropics/claude-plugins-official` |
 | claude-code-plugins | `anthropics/claude-code` |
-| Mixedbread-Grep | `mixedbread-ai/mgrep` |
+| Mixedbread-Grep (@mixedbread-ai) | `mixedbread-ai/mgrep` |
 
 ***
 

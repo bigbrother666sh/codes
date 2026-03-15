@@ -1,6 +1,7 @@
 ---
 name: configure-ecc
-description: Everything Claude Code 的交互式安装程序 — 引导用户选择并安装技能和规则到用户级或项目级目录，验证路径，并可选择性地优化已安装的文件。
+description: Everything Claude Code 的交互式安装程序 — 引导用户选择并安装技能和规则到用户级或项目级目录，验证路径，并可选择优化已安装文件。
+origin: ECC
 ---
 
 # 配置 Everything Claude Code (ECC)
@@ -66,9 +67,26 @@ mkdir -p $TARGET/skills $TARGET/rules
 
 ## 步骤 2：选择并安装技能
 
-### 2a：选择技能类别
+### 2a: 选择范围（核心 vs 细分领域）
 
-共有 27 项技能，分为 4 个类别。使用 `AskUserQuestion` 和 `multiSelect: true`：
+默认为 **核心（推荐给新用户）** — 对于研究优先的工作流，复制 `.agents/skills/*` 加上 `skills/search-first/`。此捆绑包涵盖工程、评估、验证、安全、战略压缩、前端设计以及 Anthropic 跨职能技能（文章写作、内容引擎、市场研究、前端幻灯片）。
+
+使用 `AskUserQuestion`（单选）：
+
+```
+Question: "Install core skills only, or include niche/framework packs?"
+Options:
+  - "Core only (recommended)" — "tdd, e2e, evals, verification, research-first, security, frontend patterns, compacting, cross-functional Anthropic skills"
+  - "Core + selected niche" — "Add framework/domain-specific skills after core"
+  - "Niche only" — "Skip core, install specific framework/domain skills"
+Default: Core only
+```
+
+如果用户选择细分领域或核心 + 细分领域，则继续下面的类别选择，并且仅包含他们选择的那些细分领域技能。
+
+### 2b: 选择技能类别
+
+共有41项技能，分为8个类别。使用 `AskUserQuestion` 配合 `multiSelect: true`：
 
 ```
 Question: "Which skill categories do you want to install?"
@@ -76,32 +94,38 @@ Options:
   - "Framework & Language" — "Django, Spring Boot, Go, Python, Java, Frontend, Backend patterns"
   - "Database" — "PostgreSQL, ClickHouse, JPA/Hibernate patterns"
   - "Workflow & Quality" — "TDD, verification, learning, security review, compaction"
+  - "Business & Content" — "Article writing, content engine, market research, investor materials, outreach"
+  - "Research & APIs" — "Deep research, Exa search, Claude API patterns"
+  - "Social & Content Distribution" — "X/Twitter API, crossposting alongside content-engine"
+  - "Media Generation" — "fal.ai image/video/audio alongside VideoDB"
+  - "Orchestration" — "dmux multi-agent workflows"
   - "All skills" — "Install every available skill"
 ```
 
-### 2b：确认单项技能
+### 2c: 确认个人技能
 
 对于每个选定的类别，打印下面的完整技能列表，并要求用户确认或取消选择特定的技能。如果列表超过 4 项，将列表打印为文本，并使用 `AskUserQuestion`，提供一个 "安装所有列出项" 的选项，以及一个 "其他" 选项供用户粘贴特定名称。
 
-**类别：框架与语言（16 项技能）**
+**类别：框架与语言（17 项技能）**
 
 | 技能 | 描述 |
 |-------|-------------|
 | `backend-patterns` | Node.js/Express/Next.js 的后端架构、API 设计、服务器端最佳实践 |
 | `coding-standards` | TypeScript、JavaScript、React、Node.js 的通用编码标准 |
 | `django-patterns` | Django 架构、使用 DRF 的 REST API、ORM、缓存、信号、中间件 |
-| `django-security` | Django 安全：身份验证、CSRF、SQL 注入、XSS 防护 |
-| `django-tdd` | 使用 pytest-django、factory\_boy、模拟、覆盖率的 Django 测试 |
+| `django-security` | Django 安全性：身份验证、CSRF、SQL 注入、XSS 防护 |
+| `django-tdd` | 使用 pytest-django、factory\_boy、模拟、覆盖率进行 Django 测试 |
 | `django-verification` | Django 验证循环：迁移、代码检查、测试、安全扫描 |
 | `frontend-patterns` | React、Next.js、状态管理、性能、UI 模式 |
-| `golang-patterns` | 地道的 Go 模式、健壮 Go 应用程序的约定 |
-| `golang-testing` | Go 测试：表格驱动测试、子测试、基准测试、模糊测试 |
+| `frontend-slides` | 零依赖的 HTML 演示文稿、样式预览以及 PPTX 到网页的转换 |
+| `golang-patterns` | 地道的 Go 模式、构建健壮 Go 应用程序的约定 |
+| `golang-testing` | Go 测试：表驱动测试、子测试、基准测试、模糊测试 |
 | `java-coding-standards` | Spring Boot 的 Java 编码标准：命名、不可变性、Optional、流 |
 | `python-patterns` | Pythonic 惯用法、PEP 8、类型提示、最佳实践 |
-| `python-testing` | 使用 pytest、TDD、夹具、模拟、参数化的 Python 测试 |
+| `python-testing` | 使用 pytest、TDD、固件、模拟、参数化进行 Python 测试 |
 | `springboot-patterns` | Spring Boot 架构、REST API、分层服务、缓存、异步 |
 | `springboot-security` | Spring Security：身份验证/授权、验证、CSRF、密钥、速率限制 |
-| `springboot-tdd` | 使用 JUnit 5、Mockito、MockMvc、Testcontainers 的 Spring Boot TDD |
+| `springboot-tdd` | 使用 JUnit 5、Mockito、MockMvc、Testcontainers 进行 Spring Boot TDD |
 | `springboot-verification` | Spring Boot 验证：构建、静态分析、测试、安全扫描 |
 
 **类别：数据库（3 项技能）**
@@ -125,13 +149,51 @@ Options:
 | `tdd-workflow` | 强制要求 TDD，覆盖率 80% 以上：单元测试、集成测试、端到端测试 |
 | `verification-loop` | 验证和质量循环模式 |
 
+**类别：业务与内容（5 项技能）**
+
+| 技能 | 描述 |
+|-------|-------------|
+| `article-writing` | 使用笔记、示例或源文档，以指定的口吻进行长篇写作 |
+| `content-engine` | 多平台社交内容、脚本和内容再利用工作流 |
+| `market-research` | 带有来源标注的市场、竞争对手、基金和技术研究 |
+| `investor-materials` | 宣传文稿、一页简介、投资者备忘录和财务模型 |
+| `investor-outreach` | 个性化的投资者冷邮件、熟人介绍和后续跟进 |
+
+**类别：研究与API（3项技能）**
+
+| 技能 | 描述 |
+|-------|-------------|
+| `deep-research` | 使用 firecrawl 和 exa MCP 进行多源深度研究，并生成带引用的报告 |
+| `exa-search` | 通过 Exa MCP 进行网络、代码、公司和人员的神经搜索 |
+| `claude-api` | Anthropic Claude API 模式：消息、流式处理、工具使用、视觉、批处理、Agent SDK |
+
+**类别：社交与内容分发（2项技能）**
+
+| 技能 | 描述 |
+|-------|-------------|
+| `x-api` | X/Twitter API 集成，用于发帖、线程、搜索和分析 |
+| `crosspost` | 多平台内容分发，并进行平台原生适配 |
+
+**类别：媒体生成（2项技能）**
+
+| 技能 | 描述 |
+|-------|-------------|
+| `fal-ai-media` | 通过 fal.ai MCP 进行统一的AI媒体生成（图像、视频、音频） |
+| `video-editing` | AI辅助视频编辑，用于剪辑、结构化和增强实拍素材 |
+
+**类别：编排（1项技能）**
+
+| 技能 | 描述 |
+|-------|-------------|
+| `dmux-workflows` | 使用 dmux 进行多智能体编排，实现并行智能体会话 |
+
 **独立技能**
 
 | 技能 | 描述 |
 |-------|-------------|
 | `project-guidelines-example` | 用于创建项目特定技能的模板 |
 
-### 2c：执行安装
+### 2d: 执行安装
 
 对于每个选定的技能，复制整个技能目录：
 
@@ -212,7 +274,11 @@ grep -rn "skills/" $TARGET/skills/
 * `continuous-learning-v2` 引用 `~/.claude/homunculus/` 目录
 * `python-testing` 可能引用 `python-patterns`
 * `golang-testing` 可能引用 `golang-patterns`
-* 特定语言规则引用其 `common/` 对应项
+* `crosspost` 引用 `content-engine` 和 `x-api`
+* `deep-research` 引用 `exa-search`（互补的 MCP 工具）
+* `fal-ai-media` 引用 `videodb`（互补的媒体技能）
+* `x-api` 引用 `content-engine` 和 `crosspost`
+* 语言特定规则引用 `common/` 对应项
 
 ### 4d：报告问题
 

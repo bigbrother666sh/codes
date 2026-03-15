@@ -1,6 +1,7 @@
 ---
 name: postgres-patterns
-description: 基于Supabase最佳实践的PostgreSQL数据库模式，用于查询优化、架构设计、索引和安全。
+description: 用于查询优化、模式设计、索引和安全性的PostgreSQL数据库模式。基于Supabase最佳实践。
+origin: ECC
 ---
 
 # PostgreSQL 模式
@@ -150,4 +151,4 @@ SELECT pg_reload_conf();
 
 ***
 
-*基于 [Supabase Agent Skills](https://github.com/supabase/agent-skills) (MIT License)*
+*基于 Supabase 代理技能（致谢：Supabase 团队）（MIT 许可证）*

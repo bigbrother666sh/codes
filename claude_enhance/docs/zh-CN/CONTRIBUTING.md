@@ -10,6 +10,7 @@
 * [贡献智能体](#贡献智能体)
 * [贡献钩子](#贡献钩子)
 * [贡献命令](#贡献命令)
+* [跨平台与翻译](#跨平台与翻译)
 * [拉取请求流程](#拉取请求流程)
 
 ***
@@ -70,7 +71,7 @@ cp -r skills/my-skill ~/.claude/skills/  # for skills
 # Then test with Claude Code
 
 # 5. Submit PR
-git add . && git commit -m "feat: add my-skill" && git push
+git add . && git commit -m "feat: add my-skill" && git push -u origin feat/my-contribution
 ```
 
 ***
@@ -89,10 +90,11 @@ skills/
 
 ### SKILL.md 模板
 
-```markdown
+````markdown
 ---
 name: your-skill-name
 description: Brief description shown in skill list
+origin: ECC
 ---
 
 # 你的技能标题
@@ -101,30 +103,16 @@ description: Brief description shown in skill list
 
 ## 核心概念
 
-解释关键模式和准则。
+解释关键模式和指导原则。
 
 ## 代码示例
 
-`​`​`typescript
-
+```typescript
 // 包含实用、经过测试的示例
 function example() {
   // 注释良好的代码
 }
-`​`​`
-
-
-## 最佳实践
-
-- 可操作的指导原则
-- 该做与不该做的事项
-- 需要避免的常见陷阱
-
-## 适用场景
-
-描述此技能适用的场景。
-
-```
+````
 
 ### 技能清单
 
@@ -359,6 +347,29 @@ description: 在 /help 中显示的简要描述
 | `code-review.md` | 审查代码变更 |
 | `tdd.md` | TDD 工作流 |
 | `e2e.md` | E2E 测试 |
+
+***
+
+## 跨平台与翻译
+
+### 技能子集 (Codex 和 Cursor)
+
+ECC 为其他平台提供了技能子集：
+
+* **Codex:** `.agents/skills/` — `agents/openai.yaml` 中列出的技能会被 Codex 加载。
+* **Cursor:** `.cursor/skills/` — 为 Cursor 打包了一个技能子集。
+
+当您**添加一个新技能**，并且希望它在 Codex 或 Cursor 上可用时：
+
+1. 像往常一样，在 `skills/your-skill-name/` 下添加该技能。
+2. 如果它应该在 **Codex** 上可用，请将其添加到 `.agents/skills/`（复制技能目录或添加引用），并在需要时确保它在 `agents/openai.yaml` 中被引用。
+3. 如果它应该在 **Cursor** 上可用，请根据 Cursor 的布局，将其添加到 `.cursor/skills/` 下。
+
+请参考这些目录中现有技能的结构。保持这些子集同步是手动操作；如果您更新了它们，请在您的 PR 中说明。
+
+### 翻译
+
+翻译文件位于 `docs/` 下（例如 `docs/zh-CN`、`docs/zh-TW`、`docs/ja-JP`）。如果您更改了已被翻译的智能体、命令或技能，请考虑更新相应的翻译文件，或创建一个问题，以便维护者或翻译人员可以更新它们。
 
 ***
 

@@ -106,10 +106,13 @@ Agent (planner):
 
 计划之后：
 
-* 使用 `/tdd` 以测试驱动开发的方式实施
-* 如果出现构建错误，使用 `/build-fix`
-* 使用 `/code-review` 审查已完成的实施
+* 使用 `/tdd` 通过测试驱动开发来实现
+* 如果出现构建错误，请使用 `/build-fix`
+* 使用 `/code-review` 来审查已完成的实现
 
 ## 相关代理
 
-此命令调用位于 `~/.claude/agents/planner.md` 的 `planner` 代理。
+此命令调用由 ECC 提供的 `planner` 代理。
+
+对于手动安装，源文件位于：
+`agents/planner.md`

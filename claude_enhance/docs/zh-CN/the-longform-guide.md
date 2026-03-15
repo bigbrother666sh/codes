@@ -4,10 +4,10 @@
 
 ***
 
-> **前提**：本指南建立在 [关于 Claude Code 的简明指南](./the-shortform-guide.md) 之上。如果你还没有设置技能、钩子、子代理、MCP 和插件，请先阅读该指南。
+> **前提**：本指南建立在 [关于 Claude Code 的简明指南](the-shortform-guide.md) 之上。如果你还没有设置技能、钩子、子代理、MCP 和插件，请先阅读该指南。
 
 ![Reference to Shorthand Guide](../../assets/images/longform/02-shortform-reference.png)
-*速记指南 - 请先阅读它*
+*速记指南 - 请先阅读此指南*
 
 在简明指南中，我介绍了基础设置：技能和命令、钩子、子代理、MCP、插件，以及构成有效 Claude Code 工作流骨干的配置模式。那是设置指南和基础架构。
 
@@ -40,7 +40,7 @@
 要在会话间共享记忆，最好的方法是使用一个技能或命令来总结和检查进度，然后保存到 `.claude` 文件夹中的一个 `.tmp` 文件中，并在会话结束前不断追加内容。第二天，它可以将其用作上下文，并从中断处继续。为每个会话创建一个新文件，这样你就不会将旧的上下文污染到新的工作中。
 
 ![Session Storage File Tree](../../assets/images/longform/03-session-storage.png)
-*会话存储示例 -> https://github.com/affaan-m/everything-claude-code/tree/main/examples/sessions*
+*会话存储示例 -> <https://github.com/affaan-m/everything-claude-code/tree/main/examples/sessions>*
 
 Claude 创建一个总结当前状态的文件。审阅它，如果需要则要求编辑，然后重新开始。对于新的对话，只需提供文件路径。当你达到上下文限制并需要继续复杂工作时，这尤其有用。这些文件应包含：
 
@@ -112,7 +112,7 @@ alias claude-research='claude --system-prompt "$(cat ~/.claude/contexts/research
 **模型选择快速参考：**
 
 ![Model Selection Table](../../assets/images/longform/04-model-selection.png)
-*针对各种常见任务的子代理假设设置及选择背后的理由*
+*针对各种常见任务的子代理假设设置及选择背后的推理*
 
 | 任务类型                 | 模型   | 原因                                       |
 | ------------------------- | ------ | ------------------------------------------ |
@@ -130,14 +130,14 @@ alias claude-research='claude --system-prompt "$(cat ~/.claude/contexts/research
 **定价参考：**
 
 ![Claude Model Pricing](../../assets/images/longform/05-pricing-table.png)
-*来源：https://platform.claude.com/docs/en/about-claude/pricing*
+*来源: <https://platform.claude.com/docs/en/about-claude/pricing>*
 
 **工具特定优化：**
 
 用 mgrep 替换 grep——与传统 grep 或 ripgrep 相比，平均减少约 50% 的令牌：
 
-![mgrep Benchmark](../../assets/images/longform/06-mgrep-benchmark.png)
-*在我们的 50 项任务基准测试中，mgrep + Claude Code 使用了比基于 grep 的工作流少约 2 倍的 token，且判断质量相似或更好。来源：https://github.com/mixedbread-ai/mgrep*
+![mgrep 基准测试](../../assets/images/longform/06-mgrep-benchmark.png)
+*在我们的 50 个任务基准测试中，mgrep + Claude Code 在相似或更好的判断质量下，使用的 token 数比基于 grep 的工作流少约 2 倍。来源：@mixedbread-ai 的 mgrep*
 
 **模块化代码库的好处：**
 
@@ -204,7 +204,7 @@ cd ../project-feature-a && claude
 **如果** 你要开始扩展实例数量 **并且** 你有多个 Claude 实例在处理相互重叠的代码，那么你必须使用 git worktrees，并为每个实例制定非常明确的计划。使用 `/rename <name here>` 来命名你所有的聊天。
 
 ![Two Terminal Setup](../../assets/images/longform/08-two-terminals.png)
-*初始设置：左终端用于编码，右终端用于提问 - 使用 /rename 和 /fork*
+*初始设置：左侧终端用于编码，右侧终端用于提问 - 使用 /rename 和 /fork 命令*
 
 **级联方法：**
 
@@ -296,7 +296,7 @@ cd ../project-feature-a && claude
 
 你可以使用 `/statusline` 来设置它 - 然后 Claude 会说你没有状态栏，但可以为你设置，并询问你想要在里面放什么。
 
-另请参阅：https://github.com/sirmalloc/ccstatusline
+另请参阅：ccstatusline（用于自定义 Claude Code 状态行的社区项目）
 
 ### 语音转录
 
@@ -327,16 +327,16 @@ alias q='cd ~/Desktop/projects'
 
 **智能体编排：**
 
-* https://github.com/ruvnet/claude-flow - 拥有 54+ 个专业智能体的企业级编排平台
+* claude-flow — 社区构建的企业级编排平台，包含 54+ 个专业代理
 
 **自我改进记忆：**
 
-* https://github.com/affaan-m/everything-claude-code/tree/main/skills/continuous-learning
+* 请参阅本仓库中的 `skills/continuous-learning/`
 * rlancemartin.github.io/2025/12/01/claude\_diary/ - 会话反思模式
 
 **系统提示词参考：**
 
-* https://github.com/x1xhlol/system-prompts-and-models-of-ai-tools - 系统提示词集合 (110k stars)
+* system-prompts-and-models-of-ai-tools — 社区收集的 AI 系统提示（110k+ 星标）
 
 **官方：**
 

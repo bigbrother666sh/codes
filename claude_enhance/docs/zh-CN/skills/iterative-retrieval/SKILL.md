@@ -1,11 +1,20 @@
 ---
 name: iterative-retrieval
-description: 用于逐步优化上下文检索以解决子代理上下文问题的模式
+description: 逐步优化上下文检索以解决子代理上下文问题的模式
+origin: ECC
 ---
 
 # 迭代检索模式
 
 解决多智能体工作流中的“上下文问题”，即子智能体在开始工作前不知道需要哪些上下文。
+
+## 何时激活
+
+* 当需要生成需要代码库上下文但无法预先预测的子代理时
+* 构建需要逐步完善上下文的多代理工作流时
+* 在代理任务中遇到"上下文过大"或"缺少上下文"的失败时
+* 为代码探索设计类似 RAG 的检索管道时
+* 在代理编排中优化令牌使用时
 
 ## 问题
 
@@ -201,6 +210,6 @@ Result: throttle.ts, middleware/index.ts, router-setup.ts
 
 ## 相关
 
-* [长篇指南](https://x.com/affaanmustafa/status/2014040193557471352) - 子智能体编排部分
-* `continuous-learning` 技能 - 用于随时间改进的模式
-* 在 `~/.claude/agents/` 中的智能体定义
+* [长篇指南](https://x.com/affaanmustafa/status/2014040193557471352) - 子代理编排章节
+* `continuous-learning` 技能 - 适用于随时间改进的模式
+* 与 ECC 捆绑的代理定义（手动安装路径：`agents/`）

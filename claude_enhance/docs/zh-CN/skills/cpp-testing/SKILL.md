@@ -1,6 +1,7 @@
 ---
 name: cpp-testing
-description: 仅在编写/更新/修复C++测试、配置GoogleTest/CTest、诊断失败或不稳定的测试，或添加覆盖率/消毒器时使用。
+description: 仅用于编写/更新/修复C++测试、配置GoogleTest/CTest、诊断失败或不稳定的测试，或添加覆盖率/消毒器时使用。
+origin: ECC
 ---
 
 # C++ 测试（代理技能）
@@ -160,6 +161,7 @@ include(FetchContent)
 set(GTEST_VERSION v1.17.0) # Adjust to project policy.
 FetchContent_Declare(
   googletest
+  # Google Test framework (official repository)
   URL https://github.com/google/googletest/archive/refs/tags/${GTEST_VERSION}.zip
 )
 FetchContent_MakeAvailable(googletest)
