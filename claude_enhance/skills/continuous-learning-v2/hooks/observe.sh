@@ -27,13 +27,38 @@ if [ -z "$INPUT_JSON" ]; then
   exit 0
 fi
 
+resolve_python_cmd() {
+  if [ -n "${CLV2_PYTHON_CMD:-}" ] && command -v "$CLV2_PYTHON_CMD" >/dev/null 2>&1; then
+    printf '%s\n' "$CLV2_PYTHON_CMD"
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' python3
+    return 0
+  fi
+
+  if command -v python >/dev/null 2>&1; then
+    printf '%s\n' python
+    return 0
+  fi
+
+  return 1
+}
+
+PYTHON_CMD="$(resolve_python_cmd 2>/dev/null || true)"
+if [ -z "$PYTHON_CMD" ]; then
+  echo "[observe] No python interpreter found, skipping observation" >&2
+  exit 0
+fi
+
 # ─────────────────────────────────────────────
 # Extract cwd from stdin for project detection
 # ─────────────────────────────────────────────
 
 # Extract cwd from the hook JSON to use for project detection.
 # This avoids spawning a separate git subprocess when cwd is available.
-STDIN_CWD=$(echo "$INPUT_JSON" | python3 -c '
+STDIN_CWD=$(echo "$INPUT_JSON" | "$PYTHON_CMD" -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
@@ -49,6 +74,50 @@ if [ -n "$STDIN_CWD" ] && [ -d "$STDIN_CWD" ]; then
 fi
 
 # ─────────────────────────────────────────────
+# Lightweight config and automated session guards
+# ─────────────────────────────────────────────
+
+CONFIG_DIR="${HOME}/.claude/homunculus"
+
+# Skip if disabled
+if [ -f "$CONFIG_DIR/disabled" ]; then
+  exit 0
+fi
+
+# Prevent observe.sh from firing on non-human sessions to avoid:
+#   - ECC observing its own Haiku observer sessions (self-loop)
+#   - ECC observing other tools' automated sessions
+#   - automated sessions creating project-scoped homunculus metadata
+
+# Layer 1: entrypoint. Only interactive terminal sessions should continue.
+case "${CLAUDE_CODE_ENTRYPOINT:-cli}" in
+  cli) ;;
+  *) exit 0 ;;
+esac
+
+# Layer 2: minimal hook profile suppresses non-essential hooks.
+[ "${ECC_HOOK_PROFILE:-standard}" = "minimal" ] && exit 0
+
+# Layer 3: cooperative skip env var for automated sessions.
+[ "${ECC_SKIP_OBSERVE:-0}" = "1" ] && exit 0
+
+# Layer 4: subagent sessions are automated by definition.
+_ECC_AGENT_ID=$(echo "$INPUT_JSON" | "$PYTHON_CMD" -c "import json,sys; print(json.load(sys.stdin).get('agent_id',''))" 2>/dev/null || true)
+[ -n "$_ECC_AGENT_ID" ] && exit 0
+
+# Layer 5: known observer-session path exclusions.
+_ECC_SKIP_PATHS="${ECC_OBSERVE_SKIP_PATHS:-observer-sessions,.claude-mem}"
+if [ -n "$STDIN_CWD" ]; then
+  IFS=',' read -ra _ECC_SKIP_ARRAY <<< "$_ECC_SKIP_PATHS"
+  for _pattern in "${_ECC_SKIP_ARRAY[@]}"; do
+    _pattern="${_pattern#"${_pattern%%[![:space:]]*}"}"
+    _pattern="${_pattern%"${_pattern##*[![:space:]]}"}"
+    [ -z "$_pattern" ] && continue
+    case "$STDIN_CWD" in *"$_pattern"*) exit 0 ;; esac
+  done
+fi
+
+# ─────────────────────────────────────────────
 # Project detection
 # ─────────────────────────────────────────────
 
@@ -58,23 +127,25 @@ SKILL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Source shared project detection helper
 # This sets: PROJECT_ID, PROJECT_NAME, PROJECT_ROOT, PROJECT_DIR
 source "${SKILL_ROOT}/scripts/detect-project.sh"
+PYTHON_CMD="${CLV2_PYTHON_CMD:-$PYTHON_CMD}"
 
 # ─────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────
 
-CONFIG_DIR="${HOME}/.claude/homunculus"
 OBSERVATIONS_FILE="${PROJECT_DIR}/observations.jsonl"
 MAX_FILE_SIZE_MB=10
 
-# Skip if disabled
-if [ -f "$CONFIG_DIR/disabled" ]; then
-  exit 0
+# Auto-purge observation files older than 30 days (runs once per session)
+PURGE_MARKER="${PROJECT_DIR}/.last-purge"
+if [ ! -f "$PURGE_MARKER" ] || [ "$(find "$PURGE_MARKER" -mtime +1 2>/dev/null)" ]; then
+  find "${PROJECT_DIR}" -name "observations-*.jsonl" -mtime +30 -delete 2>/dev/null || true
+  touch "$PURGE_MARKER" 2>/dev/null || true
 fi
 
-# Parse using python via stdin pipe (safe for all JSON payloads)
+# Parse using Python via stdin pipe (safe for all JSON payloads)
 # Pass HOOK_PHASE via env var since Claude Code does not include hook type in stdin JSON
-PARSED=$(echo "$INPUT_JSON" | HOOK_PHASE="$HOOK_PHASE" python3 -c '
+PARSED=$(echo "$INPUT_JSON" | HOOK_PHASE="$HOOK_PHASE" "$PYTHON_CMD" -c '
 import json
 import sys
 import os
@@ -91,7 +162,9 @@ try:
     # Extract fields - Claude Code hook format
     tool_name = data.get("tool_name", data.get("tool", "unknown"))
     tool_input = data.get("tool_input", data.get("input", {}))
-    tool_output = data.get("tool_output", data.get("output", ""))
+    tool_output = data.get("tool_response")
+    if tool_output is None:
+        tool_output = data.get("tool_output", data.get("output", ""))
     session_id = data.get("session_id", "unknown")
     tool_use_id = data.get("tool_use_id", "")
     cwd = data.get("cwd", "")
@@ -122,17 +195,26 @@ except Exception as e:
 ')
 
 # Check if parsing succeeded
-PARSED_OK=$(echo "$PARSED" | python3 -c "import json,sys; print(json.load(sys.stdin).get('parsed', False))" 2>/dev/null || echo "False")
+PARSED_OK=$(echo "$PARSED" | "$PYTHON_CMD" -c "import json,sys; print(json.load(sys.stdin).get('parsed', False))" 2>/dev/null || echo "False")
 
 if [ "$PARSED_OK" != "True" ]; then
-  # Fallback: log raw input for debugging
+  # Fallback: log raw input for debugging (scrub secrets before persisting)
   timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
   export TIMESTAMP="$timestamp"
-  echo "$INPUT_JSON" | python3 -c "
-import json, sys, os
+  echo "$INPUT_JSON" | "$PYTHON_CMD" -c '
+import json, sys, os, re
+
+_SECRET_RE = re.compile(
+    r"(?i)(api[_-]?key|token|secret|password|authorization|credentials?|auth)"
+    r"""(["'"'"'\s:=]+)"""
+    r"([A-Za-z]+\s+)?"
+    r"([A-Za-z0-9_\-/.+=]{8,})"
+)
+
 raw = sys.stdin.read()[:2000]
-print(json.dumps({'timestamp': os.environ['TIMESTAMP'], 'event': 'parse_error', 'raw': raw}))
-" >> "$OBSERVATIONS_FILE"
+raw = _SECRET_RE.sub(lambda m: m.group(1) + m.group(2) + (m.group(3) or "") + "[REDACTED]", raw)
+print(json.dumps({"timestamp": os.environ["TIMESTAMP"], "event": "parse_error", "raw": raw}))
+' >> "$OBSERVATIONS_FILE"
   exit 0
 fi
 
@@ -147,32 +229,47 @@ if [ -f "$OBSERVATIONS_FILE" ]; then
 fi
 
 # Build and write observation (now includes project context)
+# Scrub common secret patterns from tool I/O before persisting
 timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 export PROJECT_ID_ENV="$PROJECT_ID"
 export PROJECT_NAME_ENV="$PROJECT_NAME"
 export TIMESTAMP="$timestamp"
 
-echo "$PARSED" | python3 -c "
-import json, sys, os
+echo "$PARSED" | "$PYTHON_CMD" -c '
+import json, sys, os, re
 
 parsed = json.load(sys.stdin)
 observation = {
-    'timestamp': os.environ['TIMESTAMP'],
-    'event': parsed['event'],
-    'tool': parsed['tool'],
-    'session': parsed['session'],
-    'project_id': os.environ.get('PROJECT_ID_ENV', 'global'),
-    'project_name': os.environ.get('PROJECT_NAME_ENV', 'global')
+    "timestamp": os.environ["TIMESTAMP"],
+    "event": parsed["event"],
+    "tool": parsed["tool"],
+    "session": parsed["session"],
+    "project_id": os.environ.get("PROJECT_ID_ENV", "global"),
+    "project_name": os.environ.get("PROJECT_NAME_ENV", "global")
 }
 
-if parsed['input']:
-    observation['input'] = parsed['input']
-if parsed['output'] is not None:
-    observation['output'] = parsed['output']
+# Scrub secrets: match common key=value, key: value, and key"value patterns
+# Includes optional auth scheme (e.g., "Bearer", "Basic") before token
+_SECRET_RE = re.compile(
+    r"(?i)(api[_-]?key|token|secret|password|authorization|credentials?|auth)"
+    r"""(["'"'"'\s:=]+)"""
+    r"([A-Za-z]+\s+)?"
+    r"([A-Za-z0-9_\-/.+=]{8,})"
+)
+
+def scrub(val):
+    if val is None:
+        return None
+    return _SECRET_RE.sub(lambda m: m.group(1) + m.group(2) + (m.group(3) or "") + "[REDACTED]", str(val))
+
+if parsed["input"]:
+    observation["input"] = scrub(parsed["input"])
+if parsed["output"] is not None:
+    observation["output"] = scrub(parsed["output"])
 
 print(json.dumps(observation))
-" >> "$OBSERVATIONS_FILE"
+' >> "$OBSERVATIONS_FILE"
 
 # Signal observer if running (check both project-scoped and global observer)
 for pid_file in "${PROJECT_DIR}/.observer.pid" "${CONFIG_DIR}/.observer.pid"; do
