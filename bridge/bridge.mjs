@@ -1897,11 +1897,11 @@ async function handleSlashCommand(pm, alias, text) {
       return { text: `项目 ${target} 正在处理消息，请先等待完成或 /interrupt 打断后再切换模型。` };
     }
 
-    // Normalise shorthand names
+    // Normalise shorthand names — [1m] suffix enables 1M context window
     const modelAliases = {
-      opus: 'claude-opus-4-6',
-      sonnet: 'claude-sonnet-4-6',
-      haiku: 'claude-haiku-4-5-20251001',
+      opus: 'opus[1m]',
+      sonnet: 'sonnet[1m]',
+      haiku: 'haiku',
     };
     const resolved = modelAliases[arg.toLowerCase()] || arg;
 
