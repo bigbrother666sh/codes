@@ -101,7 +101,7 @@ security-reviewer, silent-failure-hunter, tdd-guide, type-design-analyzer, types
 
 ### 追踪的 Rules（`claude_enhance/rules/`）
 
-- `common/`：agents, coding-style, git-workflow, hooks, patterns, performance, security, testing
+- `common/`：agents, code-review, coding-style, development-workflow, git-workflow, hooks, patterns, performance, security, testing
 - `golang/`：coding-style, hooks, patterns, security, testing
 - `python/`：coding-style, hooks, patterns, security, testing
 - `typescript/`：coding-style, hooks, patterns, security, testing
