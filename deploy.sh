@@ -55,7 +55,7 @@ else
   ok "Node.js $(node --version) 已安装"
 fi
 
-# 配置 npm 用户级全局目录（使 Claude Code 可自动更新）
+# 配置 npm 用户级全局目录（使 claude 命令在 PATH 中可用）
 NPM_GLOBAL="$HOME/.npm-global"
 mkdir -p "$NPM_GLOBAL"
 npm config set prefix "$NPM_GLOBAL"
@@ -107,12 +107,14 @@ read -rp "  选择 (1/2) [1]: " API_CHOICE
 API_CHOICE=${API_CHOICE:-1}
 
 if [ "$API_CHOICE" = "1" ]; then
-  read -rsp "  请输入 Anthropic Auth Token (ANTHROPIC_AUTH_TOKEN): " ANTHROPIC_AUTH_TOKEN
+  ANTHROPIC_AUTH_TOKEN=""
+  read -rsp "  请输入 Anthropic Auth Token (ANTHROPIC_AUTH_TOKEN): " ANTHROPIC_AUTH_TOKEN || true
   echo ""
   ANTHROPIC_BASE_URL=""
 else
   read -rp "  请输入 API Base URL: " ANTHROPIC_BASE_URL
-  read -rsp "  请输入 Auth Token: " ANTHROPIC_AUTH_TOKEN
+  ANTHROPIC_AUTH_TOKEN=""
+  read -rsp "  请输入 Auth Token: " ANTHROPIC_AUTH_TOKEN || true
   echo ""
 fi
 
@@ -120,7 +122,8 @@ fi
 echo ""
 echo -e "${BLUE}[2/3] 飞书配置${NC}"
 read -rp "  飞书 App ID (cli_xxx): " FEISHU_APP_ID
-read -rsp "  飞书 App Secret: " FEISHU_APP_SECRET
+FEISHU_APP_SECRET=""
+read -rsp "  飞书 App Secret: " FEISHU_APP_SECRET || true
 echo ""
 
 # --- 项目配置 ---
@@ -190,6 +193,7 @@ fi
 {
   [ -n "$ANTHROPIC_BASE_URL" ] && echo "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}"
   echo "ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}"
+  echo "DISABLE_AUTO_UPDATE=1"
 } > "$HOME/.codes/bridge.env"
 chmod 600 "$HOME/.codes/bridge.env"
 ok "API 环境变量已写入 ~/.codes/bridge.env"
@@ -225,6 +229,7 @@ else
   mkdir -p "$CLAUDE_DIR/rules/typescript"
   mkdir -p "$CLAUDE_DIR/rules/python"
   mkdir -p "$CLAUDE_DIR/rules/golang"
+  mkdir -p "$CLAUDE_DIR/rules/web"
 
   # 6.2: 安装 agents
   cp "$ENHANCE_DIR/agents/"*.md "$CLAUDE_DIR/agents/"
@@ -235,7 +240,8 @@ else
   cp "$ENHANCE_DIR/rules/typescript/"*.md "$CLAUDE_DIR/rules/typescript/"
   cp "$ENHANCE_DIR/rules/python/"*.md "$CLAUDE_DIR/rules/python/"
   cp "$ENHANCE_DIR/rules/golang/"*.md "$CLAUDE_DIR/rules/golang/"
-  ok "rules 已安装 (common, typescript, python, golang)"
+  [ -d "$ENHANCE_DIR/rules/web" ] && cp "$ENHANCE_DIR/rules/web/"*.md "$CLAUDE_DIR/rules/web/"
+  ok "rules 已安装 (common, typescript, python, golang, web)"
 
   # 6.4: 安装 commands（处理与内置命令的冲突）
   # Claude Code 内置命令: /plan (切换 Plan 模式)
