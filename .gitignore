@@ -2,7 +2,7 @@ node_modules/
 bridge/node_modules/
 bridge/.env
 bridge/bridge.json
-
+claude-code/
 .DS_Store
 *.log
 backups/
