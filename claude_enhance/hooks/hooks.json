@@ -51,18 +51,6 @@
           }
         ],
         "description": "Suggest manual compaction at logical intervals"
-      },
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/hooks/run-with-flags-shell.sh\" \"pre:observe\" \"skills/continuous-learning-v2/hooks/observe.sh\" \"standard,strict\"",
-            "async": true,
-            "timeout": 10
-          }
-        ],
-        "description": "Capture tool use observations for continuous learning"
       }
     ],
     "PreCompact": [
@@ -144,18 +132,6 @@
           }
         ],
         "description": "Warn about console.log statements after edits"
-      },
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/hooks/run-with-flags-shell.sh\" \"post:observe\" \"skills/continuous-learning-v2/hooks/observe.sh\" \"standard,strict\"",
-            "async": true,
-            "timeout": 10
-          }
-        ],
-        "description": "Capture tool use results for continuous learning"
       }
     ],
     "Stop": [
@@ -192,18 +168,6 @@
           }
         ],
         "description": "Persist session state after each response (Stop carries transcript_path)"
-      },
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hooks/run-with-flags.js\" \"stop:evaluate-session\" \"scripts/hooks/evaluate-session.js\" \"minimal,standard,strict\"",
-            "async": true,
-            "timeout": 10
-          }
-        ],
-        "description": "Evaluate session for extractable patterns"
       },
       {
         "matcher": "*",

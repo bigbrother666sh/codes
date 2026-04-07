@@ -70,3 +70,45 @@ bridge.mjs (单 Node.js 进程)
 
 - `ci.yml`: Node.js 22, `npm ci`, 语法检查, `--selftest`
 - Commit messages 使用 conventional prefixes (`feat:`, `fix:`, `refactor:`, `docs:` 等)
+
+## ECC 同步范围（专注代码开发，排除非开发类内容）
+
+上游：`https://github.com/affaan-m/everything-claude-code`
+本地：`claude_enhance/`（在 codes 仓库内）
+
+### 追踪的 Agents（`claude_enhance/agents/`）
+
+代码开发相���：architect, build-error-resolver, code-reviewer, database-reviewer, doc-updater,
+docs-lookup, e2e-runner, gan-evaluator, gan-generator, gan-planner, go-build-resolver, go-reviewer,
+harness-optimizer, loop-operator, opensource-forker, opensource-packager, opensource-sanitizer,
+performance-optimizer, planner, pr-test-analyzer, python-reviewer, refactor-cleaner, rust-reviewer,
+security-reviewer, silent-failure-hunter, tdd-guide, type-design-analyzer, typescript-reviewer
+
+### 追踪的 Skills（`claude_enhance/skills/`）
+
+| 类别 | Skills |
+|------|--------|
+| 架构/设计 | api-design, hexagonal-architecture, backend-patterns, frontend-patterns |
+| 语言/测试 | golang-patterns, golang-testing, python-patterns, python-testing, cpp-coding-standards, cpp-testing, django-*, java-coding-standards, jpa-patterns |
+| 数据库 | postgres-patterns, database-migrations, clickhouse-io |
+| DevOps | docker-patterns, deployment-patterns, e2e-testing |
+| 安全 | security-review, security-bounty-hunter |
+| Agent/Harness | continuous-agent-loop, gan-style-harness, autonomous-agent-harness, agent-introspection-debugging, eval-harness |
+| 工具/流程 | tdd-workflow, verification-loop, search-first, strategic-compact, coding-standards, content-hash-cache-pattern, cost-aware-llm-pipeline, iterative-retrieval, regex-vs-llm-structured-text, prompt-optimizer, skill-stocktake, configure-ecc, project-guidelines-example |
+| 产品/协作 | product-capability, product-lens, project-flow-ops, terminal-ops, hookify-rules, safety-guard, skill-comply |
+
+**不跟踪**：非开发类 skills（logistics, carrier, energy, investor, article-writing 等）、翻译文档（docs/ja-JP, docs/zh-TW）、swift/springboot/kotlin 生态（非主力语言）、continuous-learning/v1/v2（已移除）
+
+### 追踪的 Rules（`claude_enhance/rules/`）
+
+- `common/`：agents, coding-style, git-workflow, hooks, patterns, performance, security, testing
+- `golang/`：coding-style, hooks, patterns, security, testing
+- `python/`：coding-style, hooks, patterns, security, testing
+- `typescript/`：coding-style, hooks, patterns, security, testing
+- `web/`：coding-style, design-quality, hooks, patterns, performance, security, testing
+
+### Hooks 性能优化（2026-03-31）
+
+- 移除：`post:edit:format`、`post:edit:typecheck`（每次 Edit 触发）
+- 新增：`post:edit:accumulate`（仅记录文件路径）
+- 新增：`stop:format-typecheck`（Stop 阶段批量处理，15x 延迟改善）
