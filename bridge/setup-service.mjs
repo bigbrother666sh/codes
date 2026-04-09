@@ -105,6 +105,7 @@ After=network.target
 
 [Service]
 Type=simple
+ExecStartPre=/bin/mkdir -p ${HOME}/.codes/logs
 ExecStart=${NODE_PATH} ${BRIDGE_PATH}
 WorkingDirectory=${WORK_DIR}
 Restart=always
