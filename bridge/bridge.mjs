@@ -298,12 +298,14 @@ function scheduleCleanup(filePath, minutes = INBOUND_FILE_TTL_MIN) {
   if (typeof t.unref === 'function') t.unref();
 }
 
-/** Returns milliseconds until the next daily occurrence of HH:MM (local time). */
+/** Returns milliseconds until the next daily occurrence of HH:MM (local time).
+ *  Guarantees at least 1 hour delay to prevent double-firing when called within
+ *  the same minute as the scheduled time (e.g. setTimeout fires a few seconds early). */
 function msUntilDailyTime(hour, minute) {
   const now = new Date();
   const next = new Date(now);
   next.setHours(hour, minute, 0, 0);
-  if (next <= now) next.setDate(next.getDate() + 1);
+  if (next.getTime() - now.getTime() < 3_600_000) next.setDate(next.getDate() + 1);
   return next.getTime() - now.getTime();
 }
 
@@ -2182,8 +2184,12 @@ async function sendReplyToFeishu(larkClient, chatId, replyText, replyCtx) {
 
     // Auto-detect markdown content: use interactive card for rich rendering
     if (shouldUseMarkdownCard(replyText)) {
-      await sendMarkdownCard(larkClient, chatId, replyText, incomingMessageId);
-      return;
+      try {
+        await sendMarkdownCard(larkClient, chatId, replyText, incomingMessageId);
+        return;
+      } catch {
+        // Card rendering failed (e.g. too many tables, ErrCode 11310) — fall back to plain text
+      }
     }
 
     await sendText(larkClient, chatId, replyText);
