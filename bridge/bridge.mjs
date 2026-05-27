@@ -31,7 +31,7 @@ import * as https from 'node:https';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 
 // ─── Console timestamp patch ──────────────────────────────────
 {
@@ -103,6 +103,7 @@ const MAX_ATTACHMENTS = Number(process.env.FEISHU_BRIDGE_MAX_ATTACHMENTS ?? 4);
 const SELFTEST = process.argv.includes('--selftest') || process.env.FEISHU_BRIDGE_SELFTEST === '1';
 let DEBUG = process.env.FEISHU_BRIDGE_DEBUG === '1';
 const BRIDGE_VERSION = readBridgeVersion();
+const EXPECTED_CLAUDE_VERSION = '2.1.116';
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
@@ -2517,6 +2518,22 @@ if (SELFTEST) {
 
 const bridgeConfig = loadBridgeConfig();
 if (bridgeConfig.debug) DEBUG = true;
+
+// Claude Code version check
+try {
+  const verOut = execSync(`${bridgeConfig.claudePath} --version`, { encoding: 'utf8', timeout: 5000 }).trim();
+  const match = verOut.match(/(\d+\.\d+\.\d+)/);
+  if (match && match[1] !== EXPECTED_CLAUDE_VERSION) {
+    console.warn(`[WARN] Claude Code version ${match[1]} (expected ${EXPECTED_CLAUDE_VERSION}). Compatibility not guaranteed.`);
+  } else if (match) {
+    console.log(`[OK] Claude Code v${match[1]}`);
+  } else {
+    console.warn(`[WARN] Could not parse Claude Code version: ${verOut}`);
+  }
+} catch (e) {
+  console.error(`[ERROR] Cannot find claude CLI at "${bridgeConfig.claudePath}": ${e.message}`);
+  if (!SELFTEST) process.exit(1);
+}
 
 const pm = new ProjectManager(bridgeConfig);
 await pm.init();

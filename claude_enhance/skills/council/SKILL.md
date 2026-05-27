@@ -4,202 +4,200 @@ description: Convene a four-voice council for ambiguous decisions, tradeoffs, an
 origin: ECC
 ---
 
-# Council — 四声议会决策技能
+# Council
 
-召集四个视角对模糊决策进行结构化辩论：
+Convene four advisors for ambiguous decisions:
+- the in-context Claude voice
+- a Skeptic subagent
+- a Pragmatist subagent
+- a Critic subagent
 
-- **架构师（Architect）**：当前上下文中的主声音
-- **质疑者（Skeptic）**：挑战前提，寻找最简替代方案
-- **务实者（Pragmatist）**：优先交付速度和实际执行可行性
-- **批评者（Critic）**：聚焦边缘情况、下行风险和失败模式
+This is for **decision-making under ambiguity**, not code review, implementation planning, or architecture design.
 
-本技能用于**模糊场景下的决策**，不适用于代码审查、实现规划或架构设计。
+## When to Use
 
----
+Use council when:
+- a decision has multiple credible paths and no obvious winner
+- you need explicit tradeoff surfacing
+- the user asks for second opinions, dissent, or multiple perspectives
+- conversational anchoring is a real risk
+- a go / no-go call would benefit from adversarial challenge
 
-## 使用时机
+Examples:
+- monorepo vs polyrepo
+- ship now vs hold for polish
+- feature flag vs full rollout
+- simplify scope vs keep strategic breadth
 
-遇到以下情况时激活 Council：
+## When NOT to Use
 
-- 多个路径都站得住脚，没有明显赢家
-- 需要显式呈现权衡，而非单一答案
-- 用户要求"多角度意见"或"第二方视角"
-- 对话上下文中存在锚定偏见风险
-- 决策会显著影响产品方向、crew 分工或技术选型
+| Instead of council | Use |
+| --- | --- |
+| Verifying whether output is correct | `santa-method` |
+| Breaking a feature into implementation steps | `planner` |
+| Designing system architecture | `architect` |
+| Reviewing code for bugs or security | `code-reviewer` or `santa-method` |
+| Straight factual questions | just answer directly |
+| Obvious execution tasks | just do the task |
 
-典型场景：
+## Roles
 
-- 某功能集成进全局 skill 还是单独放在 crew 的 skills 下？
-- 现在上线不完整版本还是等打磨完整后再发？
-- 某个第三方依赖自己实现还是直接调用？
-- 新 crew 独立运营还是复用现有 crew 扩展？
-- 某个功能保留在 Pro 版还是回馈开源版？
+| Voice | Lens |
+| --- | --- |
+| Architect | correctness, maintainability, long-term implications |
+| Skeptic | premise challenge, simplification, assumption breaking |
+| Pragmatist | shipping speed, user impact, operational reality |
+| Critic | edge cases, downside risk, failure modes |
 
-## 不适合使用的场景
+The three external voices should be launched as fresh subagents with **only the question and relevant context**, not the full ongoing conversation. That is the anti-anchoring mechanism.
 
-| 需求 | 改用 |
-|------|------|
-| 验证输出是否正确 | 直接 review 或用 code-reviewer agent |
-| 拆解功能实现步骤 | planner agent |
-| 设计系统架构 | architect agent |
-| 代码 bug / 安全审查 | code-reviewer agent |
-| 直接事实性问题 | 直接回答 |
-| 明确的执行任务 | 直接执行 |
+## Workflow
 
----
+### 1. Extract the real question
 
-## 四个角色定位
+Reduce the decision to one explicit prompt:
+- what are we deciding?
+- what constraints matter?
+- what counts as success?
 
-| 声音 | 关注点 |
-|------|--------|
-| Architect | 正确性、可维护性、长期影响 |
-| Skeptic | 挑战前提、质疑假设、提出最简可行替代方案 |
-| Pragmatist | 交付速度、用户影响、运营现实 |
-| Critic | ��缘情况、下行风险、方案失败模式 |
+If the question is vague, ask one clarifying question before convening the council.
 
-三个外部声音以**独立子 agent** 身份启动，只携带问题和必要上下文，**不携带完整对话历史**。这是防锚定的核心机制。
+### 2. Gather only the necessary context
 
----
+If the decision is codebase-specific:
+- collect the relevant files, snippets, issue text, or metrics
+- keep it compact
+- include only the context needed to make the decision
 
-## 执行流程
+If the decision is strategic/general:
+- skip repo snippets unless they materially change the answer
 
-### 1. 提炼真实问题
+### 3. Form the Architect position first
 
-把决策压缩为一个明确的 prompt：
-- 我们在决定什么？
-- 哪些约束是硬性的？
-- 什么算成功？
+Before reading other voices, write down:
+- your initial position
+- the three strongest reasons for it
+- the main risk in your preferred path
 
-如果问题模糊，先问一个澄清性问题，再召集议会。
+Do this first so the synthesis does not simply mirror the external voices.
 
-### 2. 收集必要上下文
+### 4. Launch three independent voices in parallel
 
-如果是代码库相关决策：
-- 只提取相关文件片段、issue 说明或关键指标
-- 保持紧凑，不堆砌无关上下文
+Each subagent gets:
+- the decision question
+- compact context if needed
+- a strict role
+- no unnecessary conversation history
 
-如果是产品/策略类决策：
-- 除非代码细节会实质影响答案，否则跳过代码片段
-
-### 3. 架构师先确立立场
-
-在读取其他声音之前，先写下：
-- 自己的初始立场
-- 支持该立场的三个最强理由
-- 自己偏好路径的主要风险
-
-**先写，避免综合时变成外部声音的镜像。**
-
-### 4. 并行启动三个独立声音
-
-每个子 agent 只获得：
-- 决策问题
-- 紧凑上下文（如需要）
-- 严格角色定义
-- 无多余对话历史
-
-Prompt 模板：
+Prompt shape:
 
 ```text
-你是四声议会中的 [角色名]。
+You are the [ROLE] on a four-voice decision council.
 
-问题：
-[决策问题]
+Question:
+[decision question]
 
-上下文：
-[仅相关片段或约束]
+Context:
+[only the relevant snippets or constraints]
 
-请按以下格式回答：
-1. 立场 — 1-2 句话
-2. 推理 — 3 条简洁要点
-3. 风险 — 你建议路径的最大风险
-4. 意外点 — 其他声音可能忽略的一点
+Respond with:
+1. Position — 1-2 sentences
+2. Reasoning — 3 concise bullets
+3. Risk — biggest risk in your recommendation
+4. Surprise — one thing the other voices may miss
 
-要求：直接、不模糊、不超过 300 字。
+Be direct. No hedging. Keep it under 300 words.
 ```
 
-角色侧重：
-- **Skeptic**：质疑问题的框架本身，挑战假设，提出最简可信的替代方案
-- **Pragmatist**：优化交付速度、简洁性和现实执行可行性
-- **Critic**：挖掘下行风险、边缘情况和方案失败的理由
+Role emphasis:
+- Skeptic: challenge framing, question assumptions, propose the simplest credible alternative
+- Pragmatist: optimize for speed, simplicity, and real-world execution
+- Critic: surface downside risk, edge cases, and reasons the plan could fail
 
-### 5. 带防偏护栏综合立场
+### 5. Synthesize with bias guardrails
 
-架构师同时是参与者和综合者，遵守以下规则：
-- 驳回外部观点时，必须说明理由
-- 如果某个外部声音改变了建议，明确说出来
-- 最强的异见必须保留在报告中，即使被拒绝
-- 如果两个声音都反对架构师的初始立场，将其视为真实信号
-- 保留原始立场可见，再给出最终裁决
+You are both a participant and the synthesizer, so use these rules:
+- do not dismiss an external view without explaining why
+- if an external voice changed your recommendation, say so explicitly
+- always include the strongest dissent, even if you reject it
+- if two voices align against your initial position, treat that as a real signal
+- keep the raw positions visible before the verdict
 
-### 6. 输出紧凑裁决
+### 6. Present a compact verdict
+
+Use this output shape:
 
 ```markdown
-## Council: [决策标题]
+## Council: [short decision title]
 
-**Architect：** [1-2 句立场]
-[一行说明理由]
+**Architect:** [1-2 sentence position]
+[1 line on why]
 
-**Skeptic：** [1-2 句立场]
-[一行说明理由]
+**Skeptic:** [1-2 sentence position]
+[1 line on why]
 
-**Pragmatist：** [1-2 句立场]
-[一行说明理由]
+**Pragmatist:** [1-2 sentence position]
+[1 line on why]
 
-**Critic：** [1-2 句立场]
-[一行说明理由]
+**Critic:** [1-2 sentence position]
+[1 line on why]
 
-### 裁决
-- **共识点：** [各方对齐的地方]
-- **最强异见：** [最重要的分歧]
-- **前提核查：** [Skeptic 是否质疑了问题本身？]
-- **建议：** [综合后的路径]
+### Verdict
+- **Consensus:** [where they align]
+- **Strongest dissent:** [most important disagreement]
+- **Premise check:** [did the Skeptic challenge the question itself?]
+- **Recommendation:** [the synthesized path]
 ```
 
-保持可在手机屏幕上快速扫读。
+Keep it scannable on a phone screen.
 
----
+## Persistence Rule
 
-## 持久化规则
+Do **not** write ad-hoc notes to `~/.claude/notes` or other shadow paths from this skill.
 
-**不要**把会议结论随意写入笔记文件。
+If the council materially changes the recommendation:
+- use `knowledge-ops` to store the lesson in the right durable location
+- or use `/save-session` if the outcome belongs in session memory
+- or update the relevant GitHub / Linear issue directly if the decision changes active execution truth
 
-如果 Council 实质改变了决策方向：
-- 将结论更新到对应的 CLAUDE.md / crew 文档 / issue
-- 只在决策真正影响执行事实时才持久化
+Only persist a decision when it changes something real.
 
----
+## Multi-Round Follow-up
 
-## 多轮跟进
+Default is one round.
 
-默认只进行一轮。
+If the user wants another round:
+- keep the new question focused
+- include the previous verdict only if it is necessary
+- keep the Skeptic as clean as possible to preserve anti-anchoring value
 
-用户要求追加轮次时：
-- 新问题保持聚焦
-- 只在确实必要时才携带上轮裁决
-- 尽量保持 Skeptic 的上下文干净，维持防锚定价值
+## Anti-Patterns
 
----
+- using council for code review
+- using council when the task is just implementation work
+- feeding the subagents the entire conversation transcript
+- hiding disagreement in the final verdict
+- persisting every decision as a note regardless of importance
 
-## 反模式
+## Related Skills
 
-- 把 Council 用于代码审查
-- 问题已经有明显答案时还召集议会
-- 把完整对话历史喂给子 agent
-- 在最终裁决中隐藏异见
-- 每次决策都写入文件不管重不重要
+- `santa-method` — adversarial verification
+- `knowledge-ops` — persist durable decision deltas correctly
+- `search-first` — gather external reference material before the council if needed
+- `architecture-decision-records` — formalize the outcome when the decision becomes long-lived system policy
 
----
+## Example
 
-## 示例
+Question:
 
-**问题：**
-> xhs-hunter 应该升级为全局 skill 还是保留在 officials addon 里？
+```text
+Should we ship ECC 2.0 as alpha now, or hold until the control-plane UI is more complete?
+```
 
-典型议会形态：
-- Architect 关注全局 skill 的标准化收益与维护成本
-- Skeptic 质疑是否真的有多个 crew 需要它，当前需求是否被夸大
-- Pragmatist 问现在迁移的实际工作量，以及能否延后决策
-- Critic 聚焦于迁移后各 crew 版本不一致的潜在风险
+Likely council shape:
+- Architect pushes for structural integrity and avoiding a confused surface
+- Skeptic questions whether the UI is actually the gating factor
+- Pragmatist asks what can be shipped now without harming trust
+- Critic focuses on support burden, expectation debt, and rollout confusion
 
-价值不在于得出一致结论，而在于让分歧在选择前变得清晰可见。
+The value is not unanimity. The value is making the disagreement legible before choosing.
