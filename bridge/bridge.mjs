@@ -13,9 +13,9 @@
  *     │     ├── stdout: reads event stream, detects type:"result" for turn completion
  *     │     └── respawn: auto-restart with --resume <session-id> on next message
  *     └── FeishuBot (one per project) — manages Feishu WebSocket connection
- *           ├── Lark.Client + Lark.WSClient (one set per bot app)
- *           ├── EventDispatcher handles im.message.receive_v1
- *           └── sendText/sendMedia replies
+ *           ├── createLarkChannel (one per bot app)
+ *           ├── channel.on({ message, cardAction, ... })
+ *           └── channel.send / channel.stream replies
  *
  * Config: ~/.codes/bridge.json
  * Sessions: ~/.codes/bridge-sessions.json (auto-saved)
@@ -917,6 +917,9 @@ class ProjectManager {
     const saveAndExit = async () => {
       this._saveSessions();
       await this.stopAll();
+      for (const ch of channelMap.values()) {
+        try { await ch.disconnect(); } catch {}
+      }
       process.exit(0);
     };
     process.on('SIGINT', () => saveAndExit());
@@ -1327,6 +1330,7 @@ async function downloadFeishuFileToPath(client, messageId, fileKey, fileName = '
   return tmp;
 }
 
+// DEPRECATED: kept for fallback
 async function buildInboundFromFeishuMessage(client, message) {
   const messageId = message?.message_id;
   const messageType = message?.message_type;
@@ -1506,24 +1510,43 @@ async function buildInboundFromFeishuMessage(client, message) {
 
 // ─── Feishu sending (text + media) ──────────────────────────────
 
-async function sendText(client, chatId, text) {
-  return client.im.v1.message.create({
-    params: { receive_id_type: 'chat_id' },
-    data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text }) },
-  });
+async function sendText(channel, chatId, text) {
+  try {
+    return await channel.send(chatId, { text });
+  } catch {
+    // Fallback to raw API if channel.send fails
+    return channel.rawClient.im.v1.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text }) },
+    });
+  }
 }
 
 /**
  * Build a Feishu interactive card (schema 2.0) with markdown content.
  * Cards render code blocks, tables, and rich formatting properly in Feishu.
  */
-function buildMarkdownCard(text) {
+function buildMarkdownCard(text, { showStopButton = false, streaming = false, summary = '' } = {}) {
+  const elements = [{ tag: 'markdown', content: text }];
+  if (showStopButton) {
+    elements.push({
+      tag: 'action',
+      actions: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: '⏹ 终止' },
+        type: 'danger',
+        value: { action: 'interrupt' },
+      }],
+    });
+  }
   return {
     schema: '2.0',
-    config: { wide_screen_mode: true },
-    body: {
-      elements: [{ tag: 'markdown', content: text }],
+    config: {
+      wide_screen_mode: true,
+      ...(streaming ? { streaming_mode: true } : {}),
+      ...(summary ? { summary: { content: summary } } : {}),
     },
+    body: { elements },
   };
 }
 
@@ -1546,27 +1569,29 @@ function shouldUseMarkdownCard(text) {
  * Send text as an interactive markdown card (interactive message type).
  * This renders code blocks, tables, bold/italic etc. properly in Feishu.
  */
-async function sendMarkdownCard(client, chatId, text, replyToMessageId) {
+async function sendMarkdownCard(channel, chatId, text, replyToMessageId) {
   const card = buildMarkdownCard(text);
-  const content = JSON.stringify(card);
+  const opts = replyToMessageId ? { replyTo: replyToMessageId } : {};
 
-  if (replyToMessageId) {
-    try {
-      const res = await client.im.v1.message.reply({
-        path: { message_id: replyToMessageId },
-        data: { content, msg_type: 'interactive' },
-      });
-      if (res?.code === 0 || res?.code === undefined) return res;
-      // Fall through to direct send if reply fails
-    } catch {
-      // Fall through to direct send
+  try {
+    return await channel.send(chatId, { card }, opts);
+  } catch {
+    // Fallback to raw API if channel.send fails
+    const content = JSON.stringify(card);
+    if (replyToMessageId) {
+      try {
+        const res = await channel.rawClient.im.v1.message.reply({
+          path: { message_id: replyToMessageId },
+          data: { content, msg_type: 'interactive' },
+        });
+        if (res?.code === 0 || res?.code === undefined) return res;
+      } catch {}
     }
+    return channel.rawClient.im.v1.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: { receive_id: chatId, msg_type: 'interactive', content },
+    });
   }
-
-  return client.im.v1.message.create({
-    params: { receive_id_type: 'chat_id' },
-    data: { receive_id: chatId, msg_type: 'interactive', content },
-  });
 }
 
 
@@ -1576,7 +1601,7 @@ async function sendMarkdownCard(client, chatId, text, replyToMessageId) {
  */
 async function addReaction(client, messageId, emojiType) {
   try {
-    const res = await client.im.messageReaction.create({
+    const res = await client.im.v1.messageReaction.create({
       path: { message_id: messageId },
       data: { reaction_type: { emoji_type: emojiType } },
     });
@@ -1591,7 +1616,7 @@ async function addReaction(client, messageId, emojiType) {
  */
 async function removeReaction(client, messageId, reactionId) {
   try {
-    await client.im.messageReaction.delete({
+    await client.im.v1.messageReaction.delete({
       path: { message_id: messageId, reaction_id: reactionId },
     });
   } catch {
@@ -1923,8 +1948,9 @@ async function handleSlashCommand(pm, alias, text) {
 
 // ─── Message queue (single-slot per project) ─────────────────────
 
-const pendingMessages = new Map(); // alias → { text, chatId, larkClient, thresholdMs }
+const pendingMessages = new Map(); // alias → { text, chatId, channel, thresholdMs }
 const scheduledMessages = new Map(); // alias → Map<jobId, { timer, chatId, text, runAt, thresholdMs }>
+let channelMap = new Map();  // alias → LarkChannel (module-level for saveAndExit access)
 
 function saveScheduledMessages() {
   try {
@@ -1950,7 +1976,7 @@ function saveScheduledMessages() {
   }
 }
 
-function restoreScheduledMessages(pm, larkClientMap, thresholdMs) {
+function restoreScheduledMessages(pm, channelMap, thresholdMs) {
   if (!fs.existsSync(SCHEDULED_PATH)) return 0;
   let data;
   try {
@@ -1963,8 +1989,8 @@ function restoreScheduledMessages(pm, larkClientMap, thresholdMs) {
   let count = 0;
   for (const [alias, jobs] of Object.entries(data)) {
     if (!Array.isArray(jobs)) continue;
-    const larkClient = larkClientMap.get(alias);
-    if (!larkClient) continue;
+    const channel = channelMap.get(alias);
+    if (!channel) continue;
     for (const job of jobs) {
       const { jobId, chatId, text, runAt, thresholdMs: jobThresholdMs } = job;
       if (!jobId || !chatId || !text || !runAt) continue;
@@ -1982,7 +2008,7 @@ function restoreScheduledMessages(pm, larkClientMap, thresholdMs) {
 
           if (isLate) {
             try {
-              await sendText(larkClient, chatId, `⏰ 定时消息（延迟送达，原定 ${formatLocalDateTime(runAt)}）：\n${text}`);
+              await sendText(channel, chatId, `⏰ 定时消息（延迟送达，原定 ${formatLocalDateTime(runAt)}）：\n${text}`);
             } catch {}
             return;
           }
@@ -1990,20 +2016,20 @@ function restoreScheduledMessages(pm, larkClientMap, thresholdMs) {
           const proj = pm.getProject(alias);
           if (!proj?.started) {
             try {
-              await sendText(larkClient, chatId, `⏰ 定时消息未发送：项目 ${alias} 未启动。\n消息内容：${text}`);
+              await sendText(channel, chatId, `⏰ 定时消息未发送：项目 ${alias} 未启动。\n消息内容：${text}`);
             } catch {}
             return;
           }
 
           const had = pendingMessages.has(alias);
-          pendingMessages.set(alias, { text, chatId, larkClient, thresholdMs: jobThresholdMs ?? thresholdMs });
+          pendingMessages.set(alias, { text, chatId, channel, thresholdMs: jobThresholdMs ?? thresholdMs });
           if (proj.claude.info().status === 'busy') {
             let note = '⏰ 定时消息已到点，已加入队列。';
             if (had) note += '\n（已替换之前排队的消息）';
-            try { await sendText(larkClient, chatId, note); } catch {}
+            try { await sendText(channel, chatId, note); } catch {}
             return;
           }
-          try { await sendText(larkClient, chatId, `⏰ 定时消息已发送：${text}`); } catch {}
+          try { await sendText(channel, chatId, `⏰ 定时消息已发送：${text}`); } catch {}
           await drainQueue(pm, alias);
         })();
       }, delayMs);
@@ -2076,7 +2102,7 @@ function cancelScheduledJobById(alias, idOrPrefix) {
   return { ok: true, jobId, job };
 }
 
-function scheduleOneOffMessage(pm, alias, chatId, larkClient, thresholdMs, payload) {
+function scheduleOneOffMessage(pm, alias, chatId, channel, thresholdMs, payload) {
   const runAt = computeDelayScheduleTime(payload.hours, payload.minutes);
   const delayMs = Math.max(0, runAt.getTime() - Date.now());
   const jobId = uuid();
@@ -2090,7 +2116,7 @@ function scheduleOneOffMessage(pm, alias, chatId, larkClient, thresholdMs, paylo
       if (!proj?.started) {
         try {
           await sendText(
-            larkClient,
+            channel,
             chatId,
             `⏰ 定时消息未发送：项目 ${alias} 未启动。\n消息内容：${payload.text}`,
           );
@@ -2102,18 +2128,18 @@ function scheduleOneOffMessage(pm, alias, chatId, larkClient, thresholdMs, paylo
       pendingMessages.set(alias, {
         text: payload.text,
         chatId,
-        larkClient,
+        channel,
         thresholdMs,
       });
 
       if (proj.claude.info().status === 'busy') {
         let note = '⏰ 定时消息已到点，已加入队列。';
         if (had) note += '\n（已替换之前排队的消息）';
-        try { await sendText(larkClient, chatId, note); } catch {}
+        try { await sendText(channel, chatId, note); } catch {}
         return;
       }
 
-      try { await sendText(larkClient, chatId, `⏰ 定时消息已发送：${payload.text}`); } catch {}
+      try { await sendText(channel, chatId, `⏰ 定时消息已发送：${payload.text}`); } catch {}
       await drainQueue(pm, alias);
     })();
   }, delayMs);
@@ -2140,12 +2166,12 @@ function scheduleOneOffMessage(pm, alias, chatId, larkClient, thresholdMs, paylo
  * Send Claude's reply back to Feishu.
  * @param {object} replyCtx  - { incomingMessageId, reactionId } for cleaning up the typing indicator
  */
-async function sendReplyToFeishu(larkClient, chatId, replyText, replyCtx) {
+async function sendReplyToFeishu(channel, chatId, replyText, replyCtx) {
   const { incomingMessageId, reactionId } = replyCtx || {};
 
   // Clean up typing indicator reaction first
   if (incomingMessageId && reactionId) {
-    await removeReaction(larkClient, incomingMessageId, reactionId);
+    await removeReaction(channel.rawClient, incomingMessageId, reactionId);
   }
 
   const parsed = parseMediaLines(replyText);
@@ -2175,10 +2201,10 @@ async function sendReplyToFeishu(larkClient, chatId, replyText, replyCtx) {
   try {
     if (mediaUrls.length > 0) {
       for (const u of mediaUrls.slice(0, 4)) {
-        await uploadAndSendMedia(larkClient, chatId, u, undefined);
+        await uploadAndSendMedia(channel.rawClient, chatId, u, undefined);
       }
       if (replyText?.trim()) {
-        await sendText(larkClient, chatId, replyText.trim());
+        await sendText(channel, chatId, replyText.trim());
       }
       return;
     }
@@ -2186,17 +2212,17 @@ async function sendReplyToFeishu(larkClient, chatId, replyText, replyCtx) {
     // Auto-detect markdown content: use interactive card for rich rendering
     if (shouldUseMarkdownCard(replyText)) {
       try {
-        await sendMarkdownCard(larkClient, chatId, replyText, incomingMessageId);
+        await sendMarkdownCard(channel, chatId, replyText, incomingMessageId);
         return;
       } catch {
         // Card rendering failed (e.g. too many tables, ErrCode 11310) — fall back to plain text
       }
     }
 
-    await sendText(larkClient, chatId, replyText);
+    await sendText(channel, chatId, replyText);
   } catch (err) {
     try {
-      await sendText(larkClient, chatId, `（发送失败）${err instanceof Error ? err.message : String(err)}`);
+      await sendText(channel, chatId, `（发送失败）${err instanceof Error ? err.message : String(err)}`);
     } catch {}
   }
 }
@@ -2210,7 +2236,7 @@ async function drainQueue(pm, alias) {
   if (!entry) return;
   pendingMessages.delete(alias);
 
-  const { text, chatId, larkClient, thresholdMs, incomingMessageId } = entry;
+  const { text, chatId, channel, thresholdMs, incomingMessageId } = entry;
 
   let reactionId = null;
   let done = false;
@@ -2219,7 +2245,7 @@ async function drainQueue(pm, alias) {
     ? setTimeout(async () => {
         if (done) return;
         if (incomingMessageId) {
-          reactionId = await addReaction(larkClient, incomingMessageId, 'Typing');
+          reactionId = await addReaction(channel.rawClient, incomingMessageId, 'Typing');
         }
       }, thresholdMs)
     : null;
@@ -2239,12 +2265,199 @@ async function drainQueue(pm, alias) {
     if (timer) clearTimeout(timer);
   }
 
-  await sendReplyToFeishu(larkClient, chatId, replyText, { incomingMessageId, reactionId });
+  await sendReplyToFeishu(channel, chatId, replyText, { incomingMessageId, reactionId });
   await drainQueue(pm, alias);
+}
+
+// ─── Card action handler ──────────────────────────────────────────
+
+function handleCardAction(pm, alias, evt) {
+  try {
+    const action = evt?.action;
+    const value = action?.value || {};
+
+    if (value.action === 'interrupt') {
+      const proj = pm.getProject(alias);
+      if (proj?.started && proj.claude.info().status === 'busy') {
+        const ok = proj.claude.interrupt();
+        console.log(`[cardAction] interrupt on "${alias}": ${ok}`);
+      }
+    }
+  } catch (e) {
+    console.error('[cardAction] error:', e);
+  }
+}
+
+// ─── NormalizedMessage handler (SDK 1.66+ createLarkChannel) ─────
+
+function createNormalizedMessageHandler(pm, alias, channel, thresholdMs) {
+  return async (msg) => {
+    try {
+      const chatId = msg.chatId;
+      const messageId = msg.messageId;
+      const chatType = msg.chatType; // 'p2p' | 'group'
+
+      if (!chatId || !messageId) return;
+      if (isDuplicate(`${alias}:${messageId}`)) return;
+
+      // SDK-normalized content (already a string, no JSON parsing needed for text/post)
+      let text = (msg.content || '').trim();
+      const attachments = [];
+
+      // Process resources (attachments) from NormalizedMessage
+      if (Array.isArray(msg.resources) && msg.resources.length > 0) {
+        for (const res of msg.resources) {
+          if (res.fileKey) {
+            attachments.push({ type: res.type || 'file', content: res.fileKey, fileName: res.fileName || res.fileKey });
+          }
+        }
+      }
+
+      // Group chat: respond only when needed
+      if (chatType === 'group') {
+        const mentioned = msg.mentionedBot || (Array.isArray(msg.mentions) && msg.mentions.length > 0);
+        const hasAttachment = attachments.length > 0;
+
+        // Remove @_user_X placeholders for routing decisions
+        const cleaned = (text || '').replace(/@_user_\d+\s*/g, '').trim();
+        const decisionText = cleaned.startsWith('【Feishu消息】') ? '' : cleaned;
+        const slashCommandMode = decisionText.startsWith('/');
+
+        // For attachment-only messages in groups: require @ mention
+        if (!slashCommandMode && hasAttachment && !mentioned && (!decisionText || decisionText === '[图片]' || decisionText === '[附件]')) return;
+
+        // For pure text: apply the normal intent filter
+        const mentions = Array.isArray(msg.mentions) ? msg.mentions : [];
+        if (!slashCommandMode && !hasAttachment && (!decisionText || !shouldRespondInGroup(decisionText, mentions))) return;
+
+        // Keep the cleaned text (so the agent doesn't see @_user_X noise)
+        text = cleaned;
+      }
+
+      // Process asynchronously (same logic as before)
+      setImmediate(async () => {
+        let reactionId = null;
+        let done = false;
+
+        const timer =
+          thresholdMs > 0
+            ? setTimeout(async () => {
+                if (done) return;
+                reactionId = await addReaction(channel.rawClient, messageId, 'Typing');
+              }, thresholdMs)
+            : null;
+
+        let replyText = '';
+        let queued = false;
+        try {
+          const trimmed = String(text || '').trim();
+          const isSlash = trimmed.startsWith('/') && attachments.length === 0;
+
+          if (isSlash) {
+            if (isLegacyClockScheduleCommand(trimmed)) {
+              replyText = '定时语法已更新：请使用 /xx-dd 消息\n例如: /2-15 两小时十五分钟后发送';
+            } else {
+              const scheduleCmd = parseDelayedSendCommand(trimmed);
+              if (scheduleCmd) {
+                if ('error' in scheduleCmd) {
+                  replyText = `错误: ${scheduleCmd.error}`;
+                } else {
+                  const proj = pm.getProject(alias);
+                  if (!proj || !proj.started) {
+                    replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
+                  } else {
+                    const scheduled = scheduleOneOffMessage(
+                      pm,
+                      alias,
+                      chatId,
+                      channel,
+                      thresholdMs,
+                      scheduleCmd,
+                    );
+                    replyText = [
+                      '⏰ 已设置定时发送（一次）',
+                      `延迟: ${scheduleCmd.hours}小时 ${scheduleCmd.minutes}分钟`,
+                      `计划时间: ${formatLocalDateTime(scheduled.runAt)}`,
+                      `消息: ${scheduleCmd.text}`,
+                      `任务: ${scheduled.jobId.slice(0, 8)}…`,
+                    ].join('\n');
+                  }
+                }
+              } else {
+                const r = await handleSlashCommand(pm, alias, trimmed);
+                if (r) {
+                  replyText = String(r.text ?? '');
+                } else {
+                  // Unknown slash command — pass through to Claude Code
+                  const proj = pm.getProject(alias);
+                  if (!proj || !proj.started) {
+                    replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
+                  } else if (proj.claude.info().status === 'busy') {
+                    const had = pendingMessages.has(alias);
+                    pendingMessages.set(alias, { text: trimmed, chatId, channel, thresholdMs, incomingMessageId: messageId });
+                    replyText = '⏳ Claude 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
+                    if (had) replyText += '\n（已替换之前排队的消息）';
+                    queued = true;
+                  } else {
+                    const result = await proj.claude.sendMessage(trimmed);
+                    replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
+                    if (!replyText.trim()) {
+                      const costNote = result?.costUsd > 0 ? ` ($${result.costUsd})` : '';
+                      replyText = `✅ ${trimmed.split(/\s/)[0]} 已执行${costNote}`;
+                    }
+                  }
+                }
+              }
+            }
+          } else {
+            const proj = pm.getProject(alias);
+            if (!proj || !proj.started) {
+              replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
+            } else {
+              // Build full text with attachment data
+              let fullText = text;
+              for (const att of attachments) {
+                fullText += `\n[附件: ${att.fileName || att.type || 'attachment'}]`;
+              }
+
+              if (proj.claude.info().status === 'busy') {
+                const had = pendingMessages.has(alias);
+                pendingMessages.set(alias, { text: fullText, chatId, channel, thresholdMs, incomingMessageId: messageId });
+                replyText = '⏳ Claude 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
+                if (had) replyText += '\n（已替换之前排队的消息）';
+                queued = true;
+              } else {
+                const result = await proj.claude.sendMessage(fullText);
+                replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
+                if (!replyText.trim()) {
+                  const costNote = result?.costUsd > 0 ? ` ($${result.costUsd})` : '';
+                  replyText = `✅ 已执行（无输出）${costNote}`;
+                }
+              }
+            }
+          }
+        } catch (e) {
+          replyText = `（系统出错）${e?.message || String(e)}`;
+        } finally {
+          done = true;
+          if (timer) clearTimeout(timer);
+        }
+
+        await sendReplyToFeishu(channel, chatId, replyText, { incomingMessageId: messageId, reactionId });
+
+        if (!queued) {
+          await drainQueue(pm, alias);
+        }
+      });
+    } catch (e) {
+      console.error('[ERROR] normalized message handler:', e);
+    }
+  };
 }
 
 // ─── Message handler factory ─────────────────────────────────────
 
+// DEPRECATED: kept for fallback
 function createMessageHandler(pm, alias, larkClient, thresholdMs) {
   return async (data) => {
     try {
@@ -2454,8 +2667,8 @@ async function runSelfTest() {
   ok('interrupt when idle', cp.interrupt() === false);
 
   // 6) pendingMessages single-slot queue
-  pendingMessages.set('test', { text: 'a', chatId: 'c', larkClient: null, thresholdMs: 0 });
-  pendingMessages.set('test', { text: 'b', chatId: 'c', larkClient: null, thresholdMs: 0 });
+  pendingMessages.set('test', { text: 'a', chatId: 'c', channel: null, thresholdMs: 0 });
+  pendingMessages.set('test', { text: 'b', chatId: 'c', channel: null, thresholdMs: 0 });
   ok('single-slot queue', pendingMessages.get('test').text === 'b');
   pendingMessages.delete('test');
 
@@ -2506,6 +2719,17 @@ async function runSelfTest() {
     return card.schema === '2.0' && card.body.elements[0].tag === 'markdown';
   })());
 
+  // 11) SDK 1.66+ createLarkChannel availability
+  ok('SDK createLarkChannel', typeof Lark.createLarkChannel === 'function');
+  ok('SDK Domain.Feishu', Lark.Domain.Feishu !== undefined);
+  ok('SDK AppType.SelfBuild', Lark.AppType.SelfBuild !== undefined);
+
+  // 12) buildMarkdownCard with options
+  const cardWithStop = buildMarkdownCard('test', { showStopButton: true, streaming: true, summary: 'thinking' });
+  ok('card with stop button', cardWithStop.body.elements.length === 2 && cardWithStop.body.elements[1].tag === 'action');
+  ok('card streaming mode', cardWithStop.config.streaming_mode === true);
+  ok('card summary', cardWithStop.config.summary.content === 'thinking');
+
   console.log('[OK] Selftests finished');
 }
 
@@ -2538,35 +2762,50 @@ try {
 const pm = new ProjectManager(bridgeConfig);
 await pm.init();
 
-// Start one Feishu bot per project
-const larkClientMap = new Map(); // alias → larkClient (for restoring scheduled messages)
+// Start one Feishu bot per project (using createLarkChannel for SDK 1.66+)
+channelMap = new Map();  // alias → LarkChannel
+const larkClientMap = new Map(); // alias → rawClient (for media/reaction helpers)
 for (const [alias, proj] of Object.entries(bridgeConfig.projects)) {
   const secret = mustRead(proj.feishu.appSecretPath, `Feishu secret for "${alias}"`);
-  const sdkConfig = {
+
+  const channel = Lark.createLarkChannel({
     appId: proj.feishu.appId,
     appSecret: secret,
     domain: Lark.Domain.Feishu,
     appType: Lark.AppType.SelfBuild,
-  };
-
-  const larkClient = new Lark.Client(sdkConfig);
-  larkClientMap.set(alias, larkClient);
-  const wsClient = new Lark.WSClient({ ...sdkConfig, loggerLevel: Lark.LoggerLevel.info });
-
-  const dispatcher = new Lark.EventDispatcher({}).register({
-    'im.message.receive_v1': createMessageHandler(
-      pm,
-      alias,
-      larkClient,
-      bridgeConfig.thinkingThresholdMs,
-    ),
+    source: 'feishu-codes-bridge',
+    loggerLevel: Lark.LoggerLevel.info,
+    policy: {
+      dmMode: 'open',
+      requireMention: false,
+      respondToMentionAll: false,
+    },
+    safety: { chatQueue: { enabled: false } },
+    includeRawEvent: true,
+    outbound: { streamThrottleMs: 400 },
+    wsConfig: { pingTimeout: 3 },
+    handshakeTimeoutMs: 8000,
   });
 
-  wsClient.start({ eventDispatcher: dispatcher });
-  console.log(`[OK] Bot started: "${alias}" (appId=${proj.feishu.appId}, path=${proj.path})`);
+  channel.on({
+    message: (msg) => {
+      void createNormalizedMessageHandler(pm, alias, channel, bridgeConfig.thinkingThresholdMs)(msg);
+    },
+    cardAction: (evt) => handleCardAction(pm, alias, evt),
+    reconnecting: () => console.log(`[WS] "${alias}" reconnecting...`),
+    reconnected: () => console.log(`[WS] "${alias}" reconnected`),
+    error: (err) => console.error(`[WS] "${alias}" error:`, err?.message || String(err)),
+  });
+
+  await channel.connect();
+  channelMap.set(alias, channel);
+  larkClientMap.set(alias, channel.rawClient);
+
+  const botId = channel.botIdentity?.openId || '?';
+  console.log(`[OK] Bot started: "${alias}" (appId=${proj.feishu.appId}, path=${proj.path}, botOpenId=${botId})`);
 }
 
-restoreScheduledMessages(pm, larkClientMap, bridgeConfig.thinkingThresholdMs);
+restoreScheduledMessages(pm, channelMap, bridgeConfig.thinkingThresholdMs);
 
 console.log(`[OK] Feishu bridge v${BRIDGE_VERSION} started — ${Object.keys(bridgeConfig.projects).length} project(s)`);
 console.log(`[OK] Allowed local media dirs: ${ALLOWED_LOCAL_MEDIA_DIRS.join(', ') || '(none)'}`);

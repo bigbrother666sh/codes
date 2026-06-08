@@ -8,7 +8,7 @@
     "setup": "node setup-service.mjs"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "1.59.0"
+    "@larksuiteoapi/node-sdk": "1.66.0"
   },
   "engines": {
     "node": ">=18"

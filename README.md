@@ -37,15 +37,32 @@
                          │                              │
                     ProjectManager                 ClaudeProcess
                     (多项目管理)                  (stream-json 协议)
+                         │
+                    createLarkChannel × N
+                    (每个项目一个飞书 bot)
 ```
 
 - **bridge.mjs** — 单 Node.js 进程，同时服务多个飞书 bot + 多个 Claude Code 子进程
 - **ClaudeProcess** — 通过 `stream-json` 协议与 Claude CLI 通信，支持会话持久化和自动重启
 - **ProjectManager** — 管理多项目生命周期，每个项目独立的 Claude 实例和飞书 bot
+- **createLarkChannel** — 飞书 SDK 1.66+ 高层 API，封装 WebSocket 连接、消息归一化、流式卡片、卡片交互回调
+
+### 飞书 SDK 能力
+
+| 能力 | 说明 |
+|------|------|
+| **消息归一化** | SDK 自动将 text/post/interactive/merge_forward 等消息类型归一化为统一格式 |
+| **流式卡片** | CardKit 2.0 + `streaming_mode`，实时推送 Claude 输出到飞书卡片 |
+| **卡片交互** | `cardAction` 回调，支持停止按钮等交互操作 |
+| **Reaction v1** | 使用 `im.v1.messageReaction` API（v0 已弃用） |
+| **WS 调优** | `pingTimeout: 3s`，`handshakeTimeoutMs: 8000`，应用层重连事件 |
+| **Bot 身份** | `channel.botIdentity` 自动获取 bot 的 open_id |
+| **优雅关闭** | `channel.disconnect()` 优雅断开 WebSocket |
 
 ## 前置要求
 
-- **Node.js** 18+（推荐 22）
+- **Node.js** 18+（推荐 22+）
+- **@larksuiteoapi/node-sdk** 1.66.0（飞书 SDK，bridge 自带）
 - **Claude Code CLI** — `npm install -g @anthropic-ai/claude-code`
 - **飞书自建应用** — 需要 App ID + App Secret（详见下方配置步骤）
 
