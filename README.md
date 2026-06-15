@@ -209,26 +209,27 @@ FEISHU_BRIDGE_MAX_INBOUND_FILE_MB=40   # 入站文件大小限制
 3. 填写应用名称（随意，比如 "My AI Assistant"）
 4. 进入应用 → **添加应用能力** → 选择 **机器人**
 5. 进入 **权限管理**，开通以下权限（推荐照抄，少踩坑）：
+   - `cardkit:card:write` — 发送/更新交互卡片（**streaming 流式回复**必须，否则回退为普通文本）
    - `im:message` — 获取与发送消息
    - `im:message:send_as_bot` — 以机器人身份发消息（避免 403）
    - `im:message.group_at_msg` — 接收群聊中 @ 机器人的消息
    - `im:message.p2p_msg` — 接收机器人单聊消息
    - `im:resource` — 上传/下载图片与文件（**收图/收视频**必须）
   
-或者选择“批量导入/导出权限”复制如下
+或者选择”批量导入/导出权限”复制如下
 
 ```json
 {
-  "scopes": {
-    "tenant": [
-      "im:resource",
-      "im:message",
-      "im:message.group_at_msg:readonly",
-      "im:message.p2p_msg:readonly",
-      "im:message:readonly",
-      "im:message:send_as_bot"
+  “scopes”: {
+    “tenant”: [
+      “cardkit:card:write”,
+      “im:message”,
+      “im:message.group_at_msg:readonly”,
+      “im:message.p2p_msg:readonly”,
+      “im:message:send_as_bot”,
+      “im:resource”
     ],
-    "user": []
+    “user”: []
   }
 }
 ```

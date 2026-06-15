@@ -2284,16 +2284,39 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
       markdown: async (controller) => {
         cardCreated = true;
 
-        finalResult = await claude.sendMessage(text, {
-          onStream: (accumulatedText) => {
-            // Strip media references for display
-            const { text: cleanText } = parseMediaLines(accumulatedText);
-            const displayText = stripMarkdownLocalMediaRefs(cleanText);
-            if (displayText) {
-              controller.setContent(displayText).catch(() => {});
-            }
-          },
-        });
+        // Show a "thinking" placeholder immediately so the user sees
+        // the card is being worked on (no blank-slate silence).
+        let hasRealContent = false;
+        controller.setContent('💭 正在思考…').catch(() => {});
+
+        // Periodically update the placeholder with elapsed time and
+        // activity info (tool name) while Claude hasn't produced text yet.
+        const progressTimer = setInterval(() => {
+          if (hasRealContent) {
+            clearInterval(progressTimer);
+            return;
+          }
+          const progress = claude.progressText();
+          if (progress) {
+            controller.setContent(`💭 ${progress}`).catch(() => {});
+          }
+        }, 1500);
+
+        try {
+          finalResult = await claude.sendMessage(text, {
+            onStream: (accumulatedText) => {
+              // Strip media references for display
+              const { text: cleanText } = parseMediaLines(accumulatedText);
+              const displayText = stripMarkdownLocalMediaRefs(cleanText);
+              if (displayText) {
+                hasRealContent = true;
+                controller.setContent(displayText).catch(() => {});
+              }
+            },
+          });
+        } finally {
+          clearInterval(progressTimer);
+        }
 
         // Final update with clean result text
         let finalDisplayText;
@@ -2316,14 +2339,49 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
     }, streamOpts);
   } catch (e) {
     if (!cardCreated) {
-      // Stream failed to start — fall back to non-streaming send
+      // Stream failed to start — fall back to non-streaming send.
+      // Show a "thinking" placeholder immediately so the user isn't
+      // left staring at silence while Claude processes.
       console.warn('[WARN] stream failed to start, falling back:', e?.message || String(e));
+      let placeholderMsgId = null;
+
+      // Helper: send/replace the placeholder with updated progress text
+      const updatePlaceholder = async (msgText) => {
+        try {
+          // Delete old placeholder first
+          if (placeholderMsgId) {
+            try { await channel.rawClient.im.v1.message.delete({ path: { message_id: placeholderMsgId } }); } catch {}
+          }
+          const phRes = await channel.rawClient.im.v1.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: msgText }) },
+          });
+          placeholderMsgId = phRes?.data?.message_id || null;
+        } catch {}
+      };
+
+      await updatePlaceholder('💭 正在思考…');
+
+      // Periodically update placeholder with elapsed time & activity
+      const fallbackTimer = setInterval(async () => {
+        const progress = claude.progressText();
+        if (progress) {
+          await updatePlaceholder(`💭 ${progress}`);
+        }
+      }, 3000);
+
       try {
         const result = await claude.sendMessage(text);
+        clearInterval(fallbackTimer);
         const replyText = result?.interrupted ? '⚡ 当前处理已被打断' : String(result?.text ?? '');
         await sendReplyToFeishu(channel, chatId, replyText, { incomingMessageId });
+        // Delete the placeholder now that the real reply is sent
+        if (placeholderMsgId) {
+          try { await channel.rawClient.im.v1.message.delete({ path: { message_id: placeholderMsgId } }); } catch {}
+        }
         return result;
       } catch (e2) {
+        clearInterval(fallbackTimer);
         await sendReplyToFeishu(channel, chatId, `（系统出错）${e2?.message || String(e2)}`, { incomingMessageId });
         return null;
       }
