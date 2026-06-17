@@ -2309,20 +2309,58 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
           }
         }, 1500);
 
+        // Throttle onStream updates to avoid exhausting Feishu streaming
+        // card edit budget (~50 edits/card). Only push to the card when:
+        // 1) the display text actually changed, AND
+        // 2) enough time has elapsed since the last setContent call.
+        // A pending update is flushed by a lightweight timer so the
+        // user still sees near-real-time progress without every single
+        // assistant event hitting the card.
+        const STREAM_THROTTLE_MS = 2000;
+        let lastStreamText = '';
+        let lastStreamTime = 0;
+        let pendingStreamUpdate = null;
+        const streamFlushTimer = setInterval(() => {
+          if (pendingStreamUpdate) {
+            const txt = pendingStreamUpdate;
+            pendingStreamUpdate = null;
+            controller.setContent(txt).catch(() => {});
+          }
+        }, STREAM_THROTTLE_MS);
+
         try {
           finalResult = await claude.sendMessage(text, {
             onStream: (accumulatedText) => {
               // Strip media references for display
               const { text: cleanText } = parseMediaLines(accumulatedText);
               const displayText = stripMarkdownLocalMediaRefs(cleanText);
-              if (displayText) {
-                hasRealContent = true;
+              if (!displayText) return;
+              hasRealContent = true;
+
+              // Skip if content hasn't changed
+              if (displayText === lastStreamText) return;
+              lastStreamText = displayText;
+
+              const now = Date.now();
+              if (now - lastStreamTime >= STREAM_THROTTLE_MS) {
+                // Enough time elapsed — push immediately
+                lastStreamTime = now;
+                pendingStreamUpdate = null;
                 controller.setContent(displayText).catch(() => {});
+              } else {
+                // Too soon — defer to next flush timer tick
+                pendingStreamUpdate = displayText;
               }
             },
           });
         } finally {
           clearInterval(progressTimer);
+          clearInterval(streamFlushTimer);
+          // Flush any pending update that was deferred by throttle
+          if (pendingStreamUpdate) {
+            controller.setContent(pendingStreamUpdate).catch(() => {});
+            pendingStreamUpdate = null;
+          }
         }
 
         // Final update with clean result text
