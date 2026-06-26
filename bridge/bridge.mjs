@@ -22,7 +22,6 @@
  */
 
 import * as Lark from '@larksuiteoapi/node-sdk';
-import axios from 'axios';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -42,78 +41,6 @@ import { spawn, execSync } from 'node:child_process';
     console[level] = (...args) => orig(`[${ts()}]`, ...args);
   }
 }
-
-// ─── Hardened HTTP instance for the Lark SDK ───────────────────
-// The SDK ships a bare `axios.create()` with no keep-alive, no timeout, and no
-// retry. Every streaming-card update therefore opens a fresh TLS connection,
-// which on a flaky network fails repeatedly with
-// `Client network socket disconnected before secure TLS connection was
-// established` (ECONNRESET). When that final-card update fails, the user's
-// conclusion never lands on the card (issue: 最终回复不更新卡片).
-//
-// This shared instance hardens ALL outbound SDK calls (streaming-card updates,
-// message sends, media uploads) by:
-//   1. Reusing TLS connections via a keep-alive agent (fewer handshakes).
-//   2. Enforcing a request timeout (the SDK default is 0 = forever, which let
-//      hung sockets accumulate and bloated the process to 4.8G).
-//   3. Retrying transient network errors with exponential backoff.
-const LARK_HTTP_TIMEOUT_MS = Number(process.env.FEISHU_BRIDGE_HTTP_TIMEOUT_MS) || 15000;
-const LARK_HTTP_MAX_RETRY = Number(process.env.FEISHU_BRIDGE_HTTP_MAX_RETRY) || 3;
-
-const _larkHttpsAgent = new https.Agent({
-  keepAlive: true,
-  keepAliveMsecs: 1000,
-  maxSockets: 32,
-  maxFreeSockets: 8,
-  timeout: LARK_HTTP_TIMEOUT_MS,
-});
-
-function _isRetryableNetworkError(err) {
-  if (!err) return false;
-  const code = err.code;
-  // Low-level socket / TLS failures before a response is received.
-  if (['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH'].includes(code)) {
-    return true;
-  }
-  // No response received at all (request never completed).
-  if (err.response === undefined && err.request !== undefined) {
-    return true;
-  }
-  // Transient server-side failures.
-  const status = err.response?.status;
-  if (status && (status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599))) {
-    return true;
-  }
-  return false;
-}
-
-function buildLarkHttpInstance() {
-  const instance = axios.create({
-    timeout: LARK_HTTP_TIMEOUT_MS,
-    httpAgent: new http.Agent({ keepAlive: true }),
-    httpsAgent: _larkHttpsAgent,
-  });
-  let retryHit = 0;
-  instance.interceptors.response.use(undefined, async (error) => {
-    const config = error?.config || {};
-    if (!config || !_isRetryableNetworkError(error)) {
-      return Promise.reject(error);
-    }
-    config.__retryCount = config.__retryCount || 0;
-    if (config.__retryCount >= LARK_HTTP_MAX_RETRY) {
-      return Promise.reject(error);
-    }
-    config.__retryCount += 1;
-    retryHit += 1;
-    const delayMs = Math.min(2000, 300 * 2 ** (config.__retryCount - 1)) + Math.floor(Math.random() * 150);
-    console.warn(`[net] retry #${config.__retryCount}/${LARK_HTTP_MAX_RETRY} in ${delayMs}ms (code=${error.code || error.response?.status}, url=${config.url?.split('?')[0]})`);
-    await new Promise((r) => setTimeout(r, delayMs));
-    return instance.request(config);
-  });
-  return instance;
-}
-
-const larkHttpInstance = buildLarkHttpInstance();
 
 // Load .env automatically (so users don't need to export env vars manually).
 // - Does NOT override existing process.env values.
@@ -3105,7 +3032,6 @@ for (const [alias, proj] of Object.entries(bridgeConfig.projects)) {
     appType: Lark.AppType.SelfBuild,
     source: 'feishu-codes-bridge',
     loggerLevel: Lark.LoggerLevel.info,
-    httpInstance: larkHttpInstance,
     policy: {
       dmMode: 'open',
       requireMention: false,
