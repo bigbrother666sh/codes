@@ -22,6 +22,7 @@
  */
 
 import * as Lark from '@larksuiteoapi/node-sdk';
+import axios from 'axios';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -41,6 +42,78 @@ import { spawn, execSync } from 'node:child_process';
     console[level] = (...args) => orig(`[${ts()}]`, ...args);
   }
 }
+
+// ─── Hardened HTTP instance for the Lark SDK ───────────────────
+// The SDK ships a bare `axios.create()` with no keep-alive, no timeout, and no
+// retry. Every streaming-card update therefore opens a fresh TLS connection,
+// which on a flaky network fails repeatedly with
+// `Client network socket disconnected before secure TLS connection was
+// established` (ECONNRESET). When that final-card update fails, the user's
+// conclusion never lands on the card (issue: 最终回复不更新卡片).
+//
+// This shared instance hardens ALL outbound SDK calls (streaming-card updates,
+// message sends, media uploads) by:
+//   1. Reusing TLS connections via a keep-alive agent (fewer handshakes).
+//   2. Enforcing a request timeout (the SDK default is 0 = forever, which let
+//      hung sockets accumulate and bloated the process to 4.8G).
+//   3. Retrying transient network errors with exponential backoff.
+const LARK_HTTP_TIMEOUT_MS = Number(process.env.FEISHU_BRIDGE_HTTP_TIMEOUT_MS) || 15000;
+const LARK_HTTP_MAX_RETRY = Number(process.env.FEISHU_BRIDGE_HTTP_MAX_RETRY) || 3;
+
+const _larkHttpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 1000,
+  maxSockets: 32,
+  maxFreeSockets: 8,
+  timeout: LARK_HTTP_TIMEOUT_MS,
+});
+
+function _isRetryableNetworkError(err) {
+  if (!err) return false;
+  const code = err.code;
+  // Low-level socket / TLS failures before a response is received.
+  if (['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH'].includes(code)) {
+    return true;
+  }
+  // No response received at all (request never completed).
+  if (err.response === undefined && err.request !== undefined) {
+    return true;
+  }
+  // Transient server-side failures.
+  const status = err.response?.status;
+  if (status && (status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599))) {
+    return true;
+  }
+  return false;
+}
+
+function buildLarkHttpInstance() {
+  const instance = axios.create({
+    timeout: LARK_HTTP_TIMEOUT_MS,
+    httpAgent: new http.Agent({ keepAlive: true }),
+    httpsAgent: _larkHttpsAgent,
+  });
+  let retryHit = 0;
+  instance.interceptors.response.use(undefined, async (error) => {
+    const config = error?.config || {};
+    if (!config || !_isRetryableNetworkError(error)) {
+      return Promise.reject(error);
+    }
+    config.__retryCount = config.__retryCount || 0;
+    if (config.__retryCount >= LARK_HTTP_MAX_RETRY) {
+      return Promise.reject(error);
+    }
+    config.__retryCount += 1;
+    retryHit += 1;
+    const delayMs = Math.min(2000, 300 * 2 ** (config.__retryCount - 1)) + Math.floor(Math.random() * 150);
+    console.warn(`[net] retry #${config.__retryCount}/${LARK_HTTP_MAX_RETRY} in ${delayMs}ms (code=${error.code || error.response?.status}, url=${config.url?.split('?')[0]})`);
+    await new Promise((r) => setTimeout(r, delayMs));
+    return instance.request(config);
+  });
+  return instance;
+}
+
+const larkHttpInstance = buildLarkHttpInstance();
 
 // Load .env automatically (so users don't need to export env vars manually).
 // - Does NOT override existing process.env values.
@@ -2281,11 +2354,19 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
   const streamOpts = incomingMessageId ? { replyTo: incomingMessageId } : {};
   let cardCreated = false;
   let finalResult = null;
+  // controller ref stashed so we can inspect `streamingFailed` after the
+  // stream completes (the SDK swallows update errors internally and only flips
+  // this flag — see MarkdownStreamControllerImpl.pushContent).
+  let streamController = null;
+  // Lifted into the outer scope so the catch block can fall back to a plain
+  // message if the streaming card never received the final content.
+  let finalDisplayText = null;
 
   try {
     await channel.stream(chatId, {
       markdown: async (controller) => {
         cardCreated = true;
+        streamController = controller;
 
         // Show a "thinking" placeholder immediately so the user sees
         // the card is being worked on (no blank-slate silence).
@@ -2345,7 +2426,6 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
         }
 
         // Final update with clean result text
-        let finalDisplayText;
         if (finalResult?.interrupted) {
           finalDisplayText = '⚡ 当前处理已被打断';
         } else {
@@ -2360,9 +2440,31 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
             finalDisplayText = `✅ 已执行（无输出）${costNote}`;
           }
         }
-        controller.setContent(finalDisplayText);
+        // Best-effort final push. The SDK schedules this through its throttle
+        // queue; if the underlying PUT fails (e.g. ECONNRESET) the SDK swallows
+        // the error and flips `streamingFailed`. We detect that below and
+        // re-deliver via a plain message so the conclusion is never lost.
+        try {
+          await controller.setContent(finalDisplayText);
+        } catch (e) {
+          console.warn('[stream] final setContent threw:', e?.message || String(e));
+        }
       },
     }, streamOpts);
+
+    // Stream completed (SDK ran completeTerminal). If the final card update
+    // failed transitively, streamingFailed is now true — re-deliver the
+    // conclusion as a plain message so the user is not left staring at a
+    // stuck "✍️ 正在生成回复…" progress marker.
+    if (streamController?.streamingFailed) {
+      console.warn('[stream] final card update failed (streamingFailed), falling back to plain message');
+      try {
+        await sendReplyToFeishu(channel, chatId, finalDisplayText ?? '', { incomingMessageId });
+      } catch (e) {
+        console.error('[stream] fallback plain message also failed:', e?.message || String(e));
+      }
+    }
+    return finalResult;
   } catch (e) {
     if (!cardCreated) {
       // Stream failed to start — fall back to non-streaming send.
@@ -2412,8 +2514,17 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
         return null;
       }
     }
-    // Stream started but producer failed — SDK already showed error in card
+    // Stream started but producer failed — SDK already showed error in card.
+    // Don't swallow silently: log it, and if we already computed the final
+    // text, re-deliver it as a plain message so the conclusion survives.
     console.error('[WARN] stream failed after card creation:', e?.message || String(e));
+    if (finalDisplayText) {
+      try {
+        await sendReplyToFeishu(channel, chatId, finalDisplayText, { incomingMessageId });
+      } catch (e2) {
+        console.error('[stream] post-failure fallback also failed:', e2?.message || String(e2));
+      }
+    }
   }
 
   // Send media files from the final result (after stream completes)
@@ -2994,6 +3105,7 @@ for (const [alias, proj] of Object.entries(bridgeConfig.projects)) {
     appType: Lark.AppType.SelfBuild,
     source: 'feishu-codes-bridge',
     loggerLevel: Lark.LoggerLevel.info,
+    httpInstance: larkHttpInstance,
     policy: {
       dmMode: 'open',
       requireMention: false,
