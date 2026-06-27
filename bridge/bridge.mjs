@@ -2309,26 +2309,48 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
         // PROGRESS_EDIT_CAP reserves headroom: stop updating progress after this
         // many edits so the final setContent always has budget left.
         const PROGRESS_EDIT_CAP = 30;
+        // Heartbeat: PATCH the card every ~60s for the whole turn so Feishu
+        // never auto-closes the streaming card (it does after 10min of
+        // inactivity). Without this, a long thinking/tool phase silences the
+        // card after the progress cap → Feishu auto-closes at 10min → the
+        // final conclusion setContent PATCH hits an already-closed card
+        // (Feishu returns 200 but doesn't render) → silent loss
+        // (streamingFailed stays false). 60s is sparse enough that the
+        // ~50-edit/card budget lasts ~50min before rollover kicks in.
+        const HEARTBEAT_INTERVAL_MS = 60_000;
         let progressEditCount = 0;
         let lastActivityKey = '';
+        const turnStartAt = Date.now();
+        let lastHeartbeatAt = turnStartAt;
         const progressTimer = setInterval(() => {
           if (hasRealContent) {
             clearInterval(progressTimer);
             return;
           }
-          if (progressEditCount >= PROGRESS_EDIT_CAP) return;
-          const act = claude._lastActivity;
-          if (act) {
-            // Key = activity type + tool name (ignore timestamp)
-            const key = `${act.type}:${act.tool || ''}`;
-            if (key !== lastActivityKey) {
-              lastActivityKey = key;
-              const progress = claude.progressText();
-              if (progress) {
-                progressEditCount++;
-                controller.setContent(`💭 ${progress}`).catch(() => {});
+          // Dense progress edits on tool transitions, until the cap.
+          if (progressEditCount < PROGRESS_EDIT_CAP) {
+            const act = claude._lastActivity;
+            if (act) {
+              // Key = activity type + tool name (ignore timestamp)
+              const key = `${act.type}:${act.tool || ''}`;
+              if (key !== lastActivityKey) {
+                lastActivityKey = key;
+                const progress = claude.progressText();
+                if (progress) {
+                  progressEditCount++;
+                  controller.setContent(`💭 ${progress}`).catch(() => {});
+                  lastHeartbeatAt = Date.now();
+                }
               }
             }
+          }
+          // Keep-alive heartbeat (runs even after the progress cap, and even
+          // when there's no tool activity at all — e.g. pure thinking).
+          const now = Date.now();
+          if (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
+            lastHeartbeatAt = now;
+            const elapsedMin = Math.max(1, Math.round((now - turnStartAt) / 60000));
+            controller.setContent(`⏳ 仍在处理…（已 ${elapsedMin} 分钟）`).catch(() => {});
           }
         }, 1500);
 
@@ -2353,6 +2375,7 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
         }
 
         // Final update with clean result text
+        let _conclEmptyFallback = false;
         if (finalResult?.interrupted) {
           finalDisplayText = '⚡ 当前处理已被打断';
         } else {
@@ -2365,19 +2388,60 @@ async function processAndReply(claude, text, channel, chatId, replyCtx) {
           if (!finalDisplayText.trim()) {
             const costNote = finalResult?.costUsd > 0 ? ` ($${finalResult.costUsd})` : '';
             finalDisplayText = `✅ 已执行（无输出）${costNote}`;
+            _conclEmptyFallback = true;
           }
         }
+        // [concl] diagnostic: did we actually get a conclusion from Claude?
+        console.warn(
+          '[concl] finalResult: interrupted=%s textLen=%d costUsd=%s | finalDisplayText len=%d emptyFallback=%s head=%j tail=%j',
+          !!finalResult?.interrupted,
+          String(finalResult?.text ?? '').length,
+          finalResult?.costUsd,
+          finalDisplayText.length,
+          _conclEmptyFallback,
+          finalDisplayText.slice(0, 80),
+          finalDisplayText.slice(-80),
+        );
         // Best-effort final push. The SDK schedules this through its throttle
         // queue; if the underlying PUT fails (e.g. ECONNRESET) the SDK swallows
         // the error and flips `streamingFailed`. We detect that below and
         // re-deliver via a plain message so the conclusion is never lost.
         try {
+          console.warn('[concl] calling setContent len=%d', finalDisplayText.length);
           await controller.setContent(finalDisplayText);
+          console.warn('[concl] setContent returned ok, controller.content len=%d cardId=%s', controller.content?.length, controller.cardId);
         } catch (e) {
           console.warn('[stream] final setContent threw:', e?.message || String(e));
         }
       },
     }, streamOpts);
+
+    // [concl] diagnostic: inspect SDK controller state AFTER completeTerminal.
+    // This is the key signal: if content===finalDisplayText and streamingFailed
+    // is false and seq>0, the SDK DID patch the conclusion → issue is Feishu
+    // client render (fold/collapse). If content is still the progress marker,
+    // the final setContent was lost. If streamingFailed, a PATCH threw.
+    if (streamController) {
+      const sc = streamController;
+      const scContent = String(sc.content || '');
+      console.warn(
+        '[concl] post-stream: streamingFailed=%s contentLen=%d contentHead=%j cardId=%s seq=%d rollovers=%d msgId=%s maxChars=%d overLimit=%s',
+        sc.streamingFailed,
+        scContent.length,
+        scContent.slice(0, 80),
+        sc.cardId,
+        sc.sequence,
+        sc.rolloverMessageIds?.length,
+        sc._messageId,
+        sc.maxChars,
+        scContent.length > (sc.maxChars || 30000),
+      );
+      console.warn(
+        '[concl] finalDisplayText len=%d matchesControllerContent=%s',
+        finalDisplayText?.length,
+        scContent === finalDisplayText,
+      );
+    }
 
     // Stream completed (SDK ran completeTerminal). If the final card update
     // failed transitively, streamingFailed is now true — re-deliver the
