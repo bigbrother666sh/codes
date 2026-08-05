@@ -1237,7 +1237,9 @@ class AtomCodeDaemon {
         // In build/plan mode we auto-approve here (bridge is non-interactive);
         // users wanting interactive approval should keep approvalMode='bypass'
         // or handle it via a future Feishu approval card.
-        this._respondPermission(ev.call_id, true).catch(() => {});
+        this._respondPermission(ev.call_id, true).catch((e) => {
+          console.error(`[daemon] permission auto-approve failed for ${ev.call_id}: ${e?.message || String(e)}`);
+        });
         break;
       case 'state':
         // running=false marks turn end in many flows, but we also rely on
@@ -1266,12 +1268,14 @@ class AtomCodeDaemon {
     }
   }
 
-  /** POST /live/permission to approve/deny a pending tool call. */
+  /** POST /live/permission to approve/deny a pending tool call.
+   *  Daemon expects { call_id, decision: "approve" | "deny" }; the legacy
+   *  { approved: bool } shape 422's, leaving the turn pending forever. */
   async _respondPermission(callId, approved) {
     await fetch(`${this._baseUrl()}/live/permission`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ call_id: callId, approved }),
+      body: JSON.stringify({ call_id: callId, decision: approved ? 'approve' : 'deny' }),
       signal: AbortSignal.timeout(5000),
     });
   }
