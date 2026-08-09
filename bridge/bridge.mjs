@@ -938,6 +938,7 @@ class AtomCodeDaemon {
     this._pendingReject = null;
     this._interrupted = false;
     this._providerPinned = false; // true after first successful /live/provider
+    this._pendingUserInput = null; // active request_user_input (daemon blocked waiting for user)
   }
 
   /** Base URL for the daemon's HTTP API. */
@@ -1241,6 +1242,33 @@ class AtomCodeDaemon {
           console.error(`[daemon] permission auto-approve failed for ${ev.call_id}: ${e?.message || String(e)}`);
         });
         break;
+      case 'user_input_request': {
+        // The model called request_user_input and is blocked waiting for the
+        // user's answer. Surface the question to the Feishu streaming card and
+        // remember it so the user's next message is routed as an answer
+        // (POST /live/user-input) instead of starting a new turn. Without this,
+        // _status sticks on 'busy' forever and the project appears hung.
+        this._pendingUserInput = {
+          requestId: ev.request_id,
+          header: ev.header || '',
+          question: ev.question || '',
+          mode: ev.mode || 'single',
+          options: Array.isArray(ev.options) ? ev.options : [],
+          custom: !!ev.custom,
+        };
+        const nums = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣'];
+        const lines = [`\n\n> ❓ **${ev.header || '需要你的输入'}**`];
+        if (ev.question) lines.push(`> ${ev.question}`);
+        (ev.options || []).forEach((o, i) => {
+          const label = o.label || `选项 ${i + 1}`;
+          const desc = o.description ? ` — ${o.description}` : '';
+          lines.push(`> ${nums[i] || `(${i + 1})`} ${label}${desc}`);
+        });
+        lines.push(`> _直接回复你的选择（序号或内容）${ev.custom ? '或自定义答案' : ''}：_`);
+        this._streamedText += lines.join('\n');
+        if (this._onStream) this._onStream(this._streamedText);
+        break;
+      }
       case 'state':
         // running=false marks turn end in many flows, but we also rely on
         // the explicit terminal events below. Resolve with _finalText (the
@@ -1280,6 +1308,37 @@ class AtomCodeDaemon {
     });
   }
 
+  /** Is the daemon blocked on a request_user_input answer? Returns the pending
+   *  request ({ requestId, header, question, options, ... }) or null. */
+  pendingUserInput() {
+    return this._pendingUserInput;
+  }
+
+  /** POST the user's answer to /live/user-input; the current turn resumes.
+   *  Daemon expects { request_id, response } for single-mode questions. */
+  async respondUserInput(text) {
+    const req = this._pendingUserInput;
+    if (!req) throw new Error('no pending user input');
+    this._pendingUserInput = null;
+    // If the user replied with a bare number, map it to the option label so
+    // the model gets the actual choice text rather than a digit.
+    let answer = text;
+    const n = parseInt(text, 10);
+    if (!Number.isNaN(n) && n >= 1 && n <= req.options.length) {
+      answer = req.options[n - 1].label || text;
+    }
+    const res = await fetch(`${this._baseUrl()}/live/user-input`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ request_id: req.requestId, response: answer }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`/live/user-input ${res.status} ${res.statusText} ${body.slice(0, 200)}`);
+    }
+  }
+
   /** Resolve the pending sendMessage promise with a result. */
   _complete(text) {
     if (this._status !== 'busy') return;
@@ -1288,6 +1347,7 @@ class AtomCodeDaemon {
     this._lastActivity = null;
     this._onStream = null;
     this._streamedText = '';
+    this._pendingUserInput = null;
     this._sseController?.abort();
     this._sseController = null;
     if (this._pendingResolve) {
@@ -1307,6 +1367,7 @@ class AtomCodeDaemon {
     this._lastActivity = null;
     this._onStream = null;
     this._streamedText = '';
+    this._pendingUserInput = null;
     this._sseController?.abort();
     this._sseController = null;
     if (this._pendingReject) {
@@ -3397,6 +3458,15 @@ function createNormalizedMessageHandler(pm, alias, channel, thresholdMs) {
                   const proj = pm.getProject(alias);
                   if (!proj || !proj.started) {
                     replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
+                  } else if (proj.claude.pendingUserInput?.()) {
+                    if (timer) clearTimeout(timer);
+                    if (messageId && reactionId) await removeReaction(channel.rawClient, messageId, reactionId);
+                    try {
+                      await proj.claude.respondUserInput(trimmed);
+                      replyText = null; // answer submitted; turn continues via the open streaming card
+                    } catch (e) {
+                      replyText = `⚠️ 回答提交失败：${e?.message || String(e)}\n可发 /interrupt 打断当前处理。`;
+                    }
                   } else if (proj.claude.info().status === 'busy') {
                     const had = pendingMessages.has(alias);
                     pendingMessages.set(alias, { text: trimmed, chatId, channel, thresholdMs, incomingMessageId: messageId });
@@ -3426,7 +3496,16 @@ function createNormalizedMessageHandler(pm, alias, channel, thresholdMs) {
                 fullText += `\n[附件: ${att.fileName || att.type || 'attachment'}]`;
               }
 
-              if (proj.claude.info().status === 'busy') {
+              if (proj.claude.pendingUserInput?.()) {
+                if (timer) clearTimeout(timer);
+                if (messageId && reactionId) await removeReaction(channel.rawClient, messageId, reactionId);
+                try {
+                  await proj.claude.respondUserInput(fullText);
+                  replyText = null; // answer submitted; turn continues via the open streaming card
+                } catch (e) {
+                  replyText = `⚠️ 回答提交失败：${e?.message || String(e)}\n可发 /interrupt 打断当前处理。`;
+                }
+              } else if (proj.claude.info().status === 'busy') {
                 const had = pendingMessages.has(alias);
                 pendingMessages.set(alias, { text: fullText, chatId, channel, thresholdMs, incomingMessageId: messageId });
                 replyText = '⏳ Claude 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
@@ -3564,6 +3643,13 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
                   const proj = pm.getProject(alias);
                   if (!proj || !proj.started) {
                     replyText = `项目 ${alias} 未启动。发送 /start 启动。`;
+                  } else if (proj.claude.pendingUserInput?.()) {
+                    try {
+                      await proj.claude.respondUserInput(trimmed);
+                      replyText = '✅ 已把你的回答提交给 AtomCode，继续处理…';
+                    } catch (e) {
+                      replyText = `⚠️ 回答提交失败：${e?.message || String(e)}\n可发 /interrupt 打断当前处理。`;
+                    }
                   } else if (proj.claude.info().status === 'busy') {
                     const had = pendingMessages.has(alias);
                     pendingMessages.set(alias, { text: trimmed, chatId, larkClient, thresholdMs, incomingMessageId: messageId });
@@ -3598,7 +3684,14 @@ function createMessageHandler(pm, alias, larkClient, thresholdMs) {
                 }
               }
 
-              if (proj.claude.info().status === 'busy') {
+              if (proj.claude.pendingUserInput?.()) {
+                try {
+                  await proj.claude.respondUserInput(fullText);
+                  replyText = '✅ 已把你的回答提交给 AtomCode，继续处理…';
+                } catch (e) {
+                  replyText = `⚠️ 回答提交失败：${e?.message || String(e)}\n可发 /interrupt 打断当前处理。`;
+                }
+              } else if (proj.claude.info().status === 'busy') {
                 const had = pendingMessages.has(alias);
                 pendingMessages.set(alias, { text: fullText, chatId, larkClient, thresholdMs, incomingMessageId: messageId });
                 replyText = '⏳ Claude 正在处理上一条消息，你的消息已排队。\n回复 /interrupt 可打断当前处理。';
