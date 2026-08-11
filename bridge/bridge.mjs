@@ -3888,20 +3888,29 @@ if (SELFTEST) {
 const bridgeConfig = loadBridgeConfig();
 if (bridgeConfig.debug) DEBUG = true;
 
-// Claude Code version check
-try {
-  const verOut = execSync(`${bridgeConfig.claudePath} --version`, { encoding: 'utf8', timeout: 5000 }).trim();
-  const match = verOut.match(/(\d+\.\d+\.\d+)/);
-  if (match && match[1] !== EXPECTED_CLAUDE_VERSION) {
-    console.warn(`[WARN] Claude Code version ${match[1]} (expected ${EXPECTED_CLAUDE_VERSION}). Compatibility not guaranteed.`);
-  } else if (match) {
-    console.log(`[OK] Claude Code v${match[1]}`);
-  } else {
-    console.warn(`[WARN] Could not parse Claude Code version: ${verOut}`);
+// Claude Code version check — only when at least one project uses the
+// "claude" backend. Pure-atomcode deployments have no claude CLI and the
+// check would fatal-exit the bridge (the systemd unit's PATH has no claude).
+const hasClaudeBackend = Object.values(bridgeConfig.projects).some(
+  (p) => (p.backend || 'claude') === 'claude',
+);
+if (!hasClaudeBackend) {
+  console.log('[OK] All projects use atomcode backend — skipping claude CLI version check.');
+} else {
+  try {
+    const verOut = execSync(`${bridgeConfig.claudePath} --version`, { encoding: 'utf8', timeout: 5000 }).trim();
+    const match = verOut.match(/(\d+\.\d+\.\d+)/);
+    if (match && match[1] !== EXPECTED_CLAUDE_VERSION) {
+      console.warn(`[WARN] Claude Code version ${match[1]} (expected ${EXPECTED_CLAUDE_VERSION}). Compatibility not guaranteed.`);
+    } else if (match) {
+      console.log(`[OK] Claude Code v${match[1]}`);
+    } else {
+      console.warn(`[WARN] Could not parse Claude Code version: ${verOut}`);
+    }
+  } catch (e) {
+    console.error(`[ERROR] Cannot find claude CLI at "${bridgeConfig.claudePath}": ${e.message}`);
+    if (!SELFTEST) process.exit(1);
   }
-} catch (e) {
-  console.error(`[ERROR] Cannot find claude CLI at "${bridgeConfig.claudePath}": ${e.message}`);
-  if (!SELFTEST) process.exit(1);
 }
 
 const pm = new ProjectManager(bridgeConfig);
