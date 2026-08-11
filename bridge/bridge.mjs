@@ -939,6 +939,39 @@ class AtomCodeDaemon {
     this._interrupted = false;
     this._providerPinned = false; // true after first successful /live/provider
     this._pendingUserInput = null; // active request_user_input (daemon blocked waiting for user)
+    // Watchdog: detect stuck-busy where the SSE pump hung (e.g. daemon
+    // crashed and the kernel kept a half-closed socket) but _status never
+    // reset. Every 60s, if busy for >5min, probe /live — if the daemon
+    // reports no running turn and no pending user_input, fail the stale turn.
+    this._watchdog = setInterval(() => this._watchdogCheck().catch(() => {}), 60_000);
+    if (typeof this._watchdog.unref === 'function') this._watchdog.unref();
+  }
+
+  async _watchdogCheck() {
+    if (this._status !== 'busy' || !this._busySince) return;
+    if (Date.now() - this._busySince < 5 * 60_000) return; // not stuck yet
+    if (!this._process || this._process.exitCode !== null) return; // daemon down — exit handler covers it
+    try {
+      const res = await fetch(`${this._baseUrl()}/live`, {
+        signal: AbortSignal.timeout(3000),
+        headers: { Accept: 'text/event-stream' },
+      });
+      if (!res.ok) return;
+      const reader = res.body.getReader();
+      const { value } = await reader.read();
+      reader.cancel().catch(() => {}); // release this probe (separate from the pump)
+      const text = new TextDecoder().decode(value || '');
+      // Parse first SSE event (snapshot) for running state.
+      const dataLine = text.split('\n').find((l) => l.startsWith('data:'));
+      if (!dataLine) return;
+      const ev = JSON.parse(dataLine.slice(5).trimStart());
+      const running = ev.running;
+      const hasPendingInput = ev.type === 'user_input_request';
+      if (running === false && !hasPendingInput) {
+        console.warn(`[daemon:watchdog] stuck busy ${Math.round((Date.now() - this._busySince) / 60_000)}min but daemon idle — resetting`);
+        this._fail(new Error('watchdog: daemon idle but bridge stuck busy'));
+      }
+    } catch {}
   }
 
   /** Base URL for the daemon's HTTP API. */
@@ -982,9 +1015,17 @@ class AtomCodeDaemon {
       this._process.stderr.on('data', (c) => process.stderr.write(`[daemon:err] ${c}`));
     }
     this._process.on('exit', (code, signal) => {
-      if (DEBUG) console.log(`[daemon] exited code=${code} signal=${signal}`);
+      console.log(`[daemon] exited code=${code} signal=${signal}`);
       this._process = null;
       this._providerPinned = false;  // re-pin after respawn
+      // Daemon died mid-turn → the SSE pump's fetch to the old daemon is now
+      // broken, but the pump may hang on reader.read() without erroring
+      // promptly (kernel can keep a half-closed socket alive). Fail the
+      // pending turn so _status doesn't stick on 'busy' and block all
+      // future messages — the next sendMessage() will respawn the daemon.
+      if (this._status === 'busy') {
+        this._fail(new Error(`daemon exited (code=${code} signal=${signal})`));
+      }
     });
 
     // Poll /health until ready (max 15s).
@@ -1394,6 +1435,7 @@ class AtomCodeDaemon {
 
   async stop() {
     this._status = 'stopped';
+    if (this._watchdog) { clearInterval(this._watchdog); this._watchdog = null; }
     this._onStream = null;
     this._streamedText = '';
     this._sseController?.abort();
