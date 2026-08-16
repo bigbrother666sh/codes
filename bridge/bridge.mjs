@@ -939,6 +939,7 @@ class AtomCodeDaemon {
     this._interrupted = false;
     this._providerPinned = false; // true after first successful /live/provider
     this._pendingUserInput = null; // active request_user_input (daemon blocked waiting for user)
+    this._token = null;            // daemon auth token (5.0.6+: /live requires Bearer auth)
     // Watchdog: detect stuck-busy where the SSE pump hung (e.g. daemon
     // crashed and the kernel kept a half-closed socket) but _status never
     // reset. Every 60s, if busy for >5min, probe /live — if the daemon
@@ -954,7 +955,7 @@ class AtomCodeDaemon {
     try {
       const res = await fetch(`${this._baseUrl()}/live`, {
         signal: AbortSignal.timeout(3000),
-        headers: { Accept: 'text/event-stream' },
+        headers: { Accept: 'text/event-stream', ...this._authHeaders() },
       });
       if (!res.ok) return;
       const reader = res.body.getReader();
@@ -977,6 +978,37 @@ class AtomCodeDaemon {
   /** Base URL for the daemon's HTTP API. */
   _baseUrl() {
     return `http://127.0.0.1:${this._port}`;
+  }
+
+  /**
+   * Auth headers for /live endpoints. Since daemon 5.0.6, every /live request
+   * requires `Authorization: Bearer <token>`; without it the SSE open and all
+   * POSTs 401 (which surfaces as every turn dying instantly). The token is
+   * written by the daemon to ~/.atomcode/daemon-<port>.json on startup and
+   * rotates per daemon instance - re-read it on every start().
+   */
+  _authHeaders() {
+    return this._token ? { Authorization: `Bearer ${this._token}` } : {};
+  }
+
+  /** Read the per-instance daemon token file. Best-effort - older daemon
+   *  versions don't write it and don't require auth, so a missing file is OK. */
+  _loadDaemonToken() {
+    try {
+      const home = process.env.ATOMCODE_HOME || path.join(os.homedir(), '.atomcode');
+      const file = path.join(home, `daemon-${this._port}.json`);
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (!parsed.token) { this._token = null; return; }
+      // Reject a stale file from a dead instance (token would 401 anyway);
+      // accept a live pid even if it isn't ours (daemon restarted externally
+      // and still owns the port - its token is the valid one).
+      let alive = false;
+      try { process.kill(Number(parsed.pid), 0); alive = true; } catch {}
+      this._token = alive ? parsed.token : null;
+    } catch {
+      this._token = null;
+    }
+    if (DEBUG) console.log(`[daemon] token ${this._token ? 'loaded' : 'not found (no auth)'}`);
   }
 
   /**
@@ -1018,6 +1050,7 @@ class AtomCodeDaemon {
       console.log(`[daemon] exited code=${code} signal=${signal}`);
       this._process = null;
       this._providerPinned = false;  // re-pin after respawn
+      this._token = null;            // token rotates per daemon instance
       // Daemon died mid-turn → the SSE pump's fetch to the old daemon is now
       // broken, but the pump may hang on reader.read() without erroring
       // promptly (kernel can keep a half-closed socket alive). Fail the
@@ -1037,6 +1070,13 @@ class AtomCodeDaemon {
         });
         if (res.ok) {
           if (DEBUG) console.log(`[daemon] ready on port ${this._port}`);
+          // Token file is written asynchronously by the daemon shortly after
+          // it starts listening - retry briefly until it appears.
+          for (let i = 0; i < 10 && !this._token; i++) {
+            this._loadDaemonToken();
+            if (this._token) break;
+            await new Promise((r) => setTimeout(r, 300));
+          }
           await this._pinProvider();
           await this._setApprovalMode();
           return;
@@ -1060,7 +1100,7 @@ class AtomCodeDaemon {
     try {
       const res = await fetch(`${this._baseUrl()}/live/provider`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...this._authHeaders() },
         body: JSON.stringify({ provider: this._model }),
         signal: AbortSignal.timeout(3000),
       });
@@ -1085,7 +1125,7 @@ class AtomCodeDaemon {
     try {
       const res = await fetch(`${this._baseUrl()}/live/mode`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...this._authHeaders() },
         body: JSON.stringify({ mode: this._approvalMode }),
         signal: AbortSignal.timeout(3000),
       });
@@ -1110,7 +1150,7 @@ class AtomCodeDaemon {
     try {
       const res = await fetch(`${this._baseUrl()}/live/provider`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...this._authHeaders() },
         body: JSON.stringify({ provider: providerName }),
         signal: AbortSignal.timeout(3000),
       });
@@ -1165,7 +1205,7 @@ class AtomCodeDaemon {
       const url = `${this._baseUrl()}/live?session_id=${encodeURIComponent(this._sessionId || '')}`;
       this._sseController = new AbortController();
 
-      fetch(url, { signal: this._sseController.signal, headers: { Accept: 'text/event-stream' } })
+      fetch(url, { signal: this._sseController.signal, headers: { Accept: 'text/event-stream', ...this._authHeaders() } })
         .then((res) => {
           if (!res.ok) throw new Error(`/live SSE failed: ${res.status} ${res.statusText}`);
           return res.body.getReader();
@@ -1184,7 +1224,7 @@ class AtomCodeDaemon {
       });
       fetch(`${this._baseUrl()}/live/message`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...this._authHeaders() },
         body,
         signal: AbortSignal.timeout(30_000),
       }).catch((err) => this._fail(err));
@@ -1343,7 +1383,7 @@ class AtomCodeDaemon {
   async _respondPermission(callId, approved) {
     await fetch(`${this._baseUrl()}/live/permission`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...this._authHeaders() },
       body: JSON.stringify({ call_id: callId, decision: approved ? 'approve' : 'deny' }),
       signal: AbortSignal.timeout(5000),
     });
@@ -1370,7 +1410,7 @@ class AtomCodeDaemon {
     }
     const res = await fetch(`${this._baseUrl()}/live/user-input`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...this._authHeaders() },
       body: JSON.stringify({ request_id: req.requestId, response: answer }),
       signal: AbortSignal.timeout(15_000),
     });
@@ -1426,6 +1466,7 @@ class AtomCodeDaemon {
     try {
       await fetch(`${this._baseUrl()}/live/cancel`, {
         method: 'POST',
+        headers: this._authHeaders(),
         signal: AbortSignal.timeout(3000),
       });
     } catch {}
