@@ -363,6 +363,16 @@ function scheduleCleanup(filePath, minutes = INBOUND_FILE_TTL_MIN) {
   if (typeof t.unref === 'function') t.unref();
 }
 
+function withTimeout(promise, ms, message) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 /** Returns milliseconds until the next daily occurrence of HH:MM (local time).
  *  Guarantees at least 1 hour delay to prevent double-firing when called within
  *  the same minute as the scheduled time (e.g. setTimeout fires a few seconds early). */
@@ -4015,7 +4025,15 @@ for (const [alias, proj] of Object.entries(bridgeConfig.projects)) {
     error: (err) => console.error(`[WS] "${alias}" error:`, err?.message || String(err)),
   });
 
-  await channel.connect();
+  try {
+    // channel.connect() has a WebSocket handshake timeout, but its initial
+    // bot-identity/token HTTP calls use the SDK default axios instance with
+    // timeout=0. A stale TUN route can therefore leave startup hanging forever.
+    await withTimeout(channel.connect(), 30_000, `Feishu channel "${alias}" connect timeout after 30000ms`);
+  } catch (e) {
+    console.error(`[FATAL] Failed to connect Feishu bot "${alias}": ${e?.message || String(e)}`);
+    throw e;
+  }
   channelMap.set(alias, channel);
   larkClientMap.set(alias, channel.rawClient);
 
