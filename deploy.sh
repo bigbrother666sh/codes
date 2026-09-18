@@ -68,11 +68,19 @@ export PATH="$NPM_GLOBAL/bin:$PATH"
 # ─── Phase 3: Codex CLI ──────────────────────────────────────────
 info "Phase 3/6: 安装 Codex CLI..."
 
-if command -v codex &>/dev/null; then
-  ok "Codex 已安装: $(codex --version 2>/dev/null || echo 'unknown')"
+# 注意: 只检查 codex 在 PATH 不够 —— npm 缓存损坏时 optional 平台二进制包
+# (@openai/codex-linux-x64) 会被静默跳过，wrapper 存在但运行即报错。
+# 必须用 codex --version 验证真实可用性，失败则清缓存重装。
+if command -v codex &>/dev/null && codex --version &>/dev/null; then
+  ok "Codex 已安装: $(codex --version)"
 else
-  npm install -g @openai/codex > /dev/null 2>&1
-  ok "Codex $(codex --version 2>/dev/null || echo '') 已安装"
+  if ! npm install -g @openai/codex > /dev/null 2>&1 || ! codex --version &>/dev/null; then
+    warn "Codex 安装异常（常见原因: npm 缓存损坏导致平台二进制包被静默跳过），清理缓存后重试..."
+    npm cache clean --force > /dev/null 2>&1
+    npm install -g @openai/codex
+  fi
+  codex --version &>/dev/null || fatal "Codex 安装后校验失败，请手动执行: npm cache clean --force && npm install -g @openai/codex@latest"
+  ok "Codex $(codex --version) 已安装"
 fi
 CODEX_BIN="$(command -v codex)"
 
