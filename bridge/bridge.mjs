@@ -10,8 +10,7 @@
  * Architecture:
  *   bridge.mjs (single Node.js process)
  *     ├── loadBridgeConfig() — reads ~/.codes/bridge.json
- *     ├── ensureCodexHome() — generates ~/.codes/codex-home/config.toml
- *     │     (providers, default model, built-in memories pipeline)
+ *     ├── Uses the local Codex configuration and default home unchanged
  *     ├── CodexAppServer (one per project) — manages codex subprocess
  *     │     ├── spawn: codex app-server (stdio JSON-RPC, JSONL)
  *     │     ├── initialize → thread/start | thread/resume (session = thread id)
@@ -26,7 +25,7 @@
  *
  * Config: ~/.codes/bridge.json
  * Sessions: ~/.codes/bridge-sessions.json (auto-saved)
- * Codex home: ~/.codes/codex-home (generated config.toml, rollouts, memories)
+ * Codex home: local default (~/.codex), or inherited CODEX_HOME; never generated
  */
 
 import * as Lark from '@larksuiteoapi/node-sdk';
@@ -373,17 +372,6 @@ function withTimeout(promise, ms, message) {
   ]).finally(() => clearTimeout(timer));
 }
 
-/** Returns milliseconds until the next daily occurrence of HH:MM (local time).
- *  Guarantees at least 1 hour delay to prevent double-firing when called within
- *  the same minute as the scheduled time (e.g. setTimeout fires a few seconds early). */
-function msUntilDailyTime(hour, minute) {
-  const now = new Date();
-  const next = new Date(now);
-  next.setHours(hour, minute, 0, 0);
-  if (next.getTime() - now.getTime() < 3_600_000) next.setDate(next.getDate() + 1);
-  return next.getTime() - now.getTime();
-}
-
 function looksLikeMediaRef(s) {
   const v = String(s || '').trim();
   if (!v) return false;
@@ -590,16 +578,10 @@ function cleanupTempFile(filePath) {
 //   ← item/*/requestApproval            server-initiated request — MUST reply
 //   → turn/interrupt                    cancel an in-flight turn
 //
-// Sandbox/approval stance: this host cannot run codex's bubblewrap sandbox
-// (user namespaces are restricted), so threads default to
-// sandbox=danger-full-access + approvalPolicy=never — the exact security
-// posture the previous Claude backend ran with (--dangerously-skip-permissions).
-// Server-initiated approval requests should therefore never occur; if one
-// ever does (config change), it is auto-answered so the turn cannot hang.
-
-const CODEX_HOME = resolvePath('~/.codes/codex-home');
-const CODEX_DEFAULT_SANDBOX = 'danger-full-access';
-const CODEX_DEFAULT_APPROVAL = 'never';
+// Inherit local Codex configuration unless an explicit thread override is set.
+const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const CODEX_DEFAULT_SANDBOX = null;
+const CODEX_DEFAULT_APPROVAL = null;
 const CODEX_INIT_TIMEOUT_MS = 60_000;
 const CODEX_RPC_TIMEOUT_MS = 30_000;
 const CODEX_INTERRUPT_WATCHDOG_MS = 8_000;
@@ -611,6 +593,7 @@ class CodexAppServer {
    *   codexPath?: string,
    *   threadId?: string | null,
    *   model?: string | null,
+   *   reasoningEffort?: string | null,
    *   provider?: string | null,
    *   sandbox?: string,
    *   approvalPolicy?: string,
@@ -623,6 +606,7 @@ class CodexAppServer {
     codexPath = 'codex',
     threadId = null,
     model = null,
+    reasoningEffort = null,
     provider = null,
     sandbox = CODEX_DEFAULT_SANDBOX,
     approvalPolicy = CODEX_DEFAULT_APPROVAL,
@@ -633,6 +617,9 @@ class CodexAppServer {
     this._codexPath = codexPath;
     this._sessionId = threadId;   // codex thread id (rollout persisted by codex)
     this._model = model;          // null = config.toml default
+    this._reasoningEffort = reasoningEffort; // null = config.toml default
+    this._defaultModel = model;
+    this._defaultReasoningEffort = reasoningEffort;
     this._provider = provider;    // null = config.toml default
     this._sandbox = sandbox;
     this._approvalPolicy = approvalPolicy;
@@ -701,7 +688,7 @@ class CodexAppServer {
     const proc = spawn(this._codexPath, ['app-server'], {
       cwd: this._workDir,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, CODEX_HOME },
+      env: { ...process.env },
     });
     this._process = proc;
 
@@ -754,8 +741,8 @@ class CodexAppServer {
     const overrides = {
       ...(this._model ? { model: this._model } : {}),
       ...(this._provider ? { modelProvider: this._provider } : {}),
-      approvalPolicy: this._approvalPolicy,
-      sandbox: this._sandbox,
+      ...(this._approvalPolicy ? { approvalPolicy: this._approvalPolicy } : {}),
+      ...(this._sandbox ? { sandbox: this._sandbox } : {}),
       // Free-form config overrides (validated against codex 0.152.1): applied
       // per thread via the `config` object, which codex merges as top-level
       // config overrides (higher precedence than config.toml). The effective
@@ -764,6 +751,7 @@ class CodexAppServer {
         const config = {
           ...(this._contextWindow ? { model_context_window: this._contextWindow } : {}),
           ...(this._extraConfig || {}),
+          ...(this._reasoningEffort ? { model_reasoning_effort: this._reasoningEffort } : {}),
         };
         return Object.keys(config).length ? { config } : {};
       })(),
@@ -831,9 +819,10 @@ class CodexAppServer {
           threadId: this._sessionId,
           input: [{ type: 'text', text }],
         };
-        // The turn-level model override also re-pins the thread default, so
-        // a runtime /model switch takes effect immediately and stays sticky.
+        // Turn-level overrides re-pin the thread settings, so runtime
+        // /model and /hard switches take effect on the next message.
         if (this._model) turnParams.model = this._model;
+        if (this._reasoningEffort) turnParams.effort = this._reasoningEffort;
 
         const res = await this._send('turn/start', turnParams, CODEX_RPC_TIMEOUT_MS);
         return res.turn;
@@ -1334,6 +1323,7 @@ class CodexAppServer {
       costUsd: this._costUsd, // total tokens (not USD — provider-dependent pricing)
       turnCount: this._turnCount,
       model: this._model || null,
+      reasoningEffort: this._reasoningEffort || null,
       provider: this._provider || null,
       contextWindow: this._contextWindow || null,
       backend: 'codex',
@@ -1348,105 +1338,6 @@ class CodexAppServer {
       return `正在处理… ${elapsed} | 工具: ${act.tool}`;
     }
     return `正在思考… ${elapsed}`;
-  }
-}
-
-// ─── Codex home (managed config.toml) ───────────────────────────
-// The bridge owns $CODEX_HOME (~/.codes/codex-home): config.toml is generated
-// from bridge.json on startup, so providers, defaults and the memories
-// pipeline have a single source of truth. Rollouts (sessions) and memories
-// also land here, which puts them inside the existing ~/.codes backup target.
-
-/** Serialize a JS value as a TOML value (scalars and arrays of scalars). */
-function toTomlValue(value) {
-  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-  if (Array.isArray(value)) return `[${value.map(toTomlValue).join(', ')}]`;
-  return JSON.stringify(String(value)); // TOML basic strings ≈ JSON strings here
-}
-
-/** Emit an object as a TOML table (scalars first, nested objects as sub-tables). */
-function emitTomlTable(lines, header, obj) {
-  lines.push('', `[${header}]`);
-  for (const [k, v] of Object.entries(obj)) {
-    if (v === null || v === undefined) continue;
-    if (typeof v === 'object' && !Array.isArray(v)) continue;
-    lines.push(`${k} = ${toTomlValue(v)}`);
-  }
-  for (const [k, v] of Object.entries(obj)) {
-    if (v && typeof v === 'object' && !Array.isArray(v)) {
-      emitTomlTable(lines, `${header}.${k}`, v);
-    }
-  }
-}
-
-function buildCodexConfigToml(config) {
-  const d = config.codexDefaults;
-  const lines = [
-    '# Generated by feishu-codes-bridge — manual edits are overwritten on startup.',
-    '# Source of truth: ~/.codes/bridge.json (providers / codexDefaults).',
-    '# Per-project model/provider overrides are applied via thread/start params.',
-    '',
-  ];
-  if (d.model) lines.push(`model = ${toTomlValue(d.model)}`);
-  if (d.provider) lines.push(`model_provider = ${toTomlValue(d.provider)}`);
-  lines.push(`approval_policy = ${toTomlValue(d.approvalPolicy || CODEX_DEFAULT_APPROVAL)}`);
-  lines.push(`sandbox_mode = ${toTomlValue(d.sandbox || CODEX_DEFAULT_SANDBOX)}`);
-  if (d.contextWindow) lines.push(`model_context_window = ${toTomlValue(Number(d.contextWindow))}`);
-  for (const [key, value] of Object.entries(d.extraConfig || {})) {
-    lines.push(`${key} = ${toTomlValue(value)}`);
-  }
-
-  // Cross-session persistent memory — replaces the old server-memory MCP.
-  // Phase 1 extracts structured memories from finished rollouts in the
-  // background; Phase 2 consolidates them globally under $CODEX_HOME/memories.
-  lines.push(
-    '',
-    '[features]',
-    'memories = true',
-    '',
-    '[memories]',
-    'use_memories = true',
-    'generate_memories = true',
-  );
-
-  for (const [key, p] of Object.entries(config.providers)) {
-    lines.push(
-      '',
-      `[model_providers.${key}]`,
-      `name = ${toTomlValue(p.name || key)}`,
-      `base_url = ${toTomlValue(p.baseUrl)}`,
-      `env_key = ${toTomlValue(p.envKey)}`,
-      `wire_api = ${toTomlValue(p.wireApi || 'responses')}`,
-    );
-  }
-
-  // MCP servers (migrated from Claude Code): passed through to codex as-is.
-  for (const [name, server] of Object.entries(config.mcpServers || {})) {
-    emitTomlTable(lines, `mcp_servers.${name}`, server);
-  }
-  return lines.join('\n') + '\n';
-}
-
-/** Write the managed config.toml (only when changed) and validate env keys. */
-function ensureCodexHome(config) {
-  fs.mkdirSync(CODEX_HOME, { recursive: true });
-  const target = path.join(CODEX_HOME, 'config.toml');
-  const desired = buildCodexConfigToml(config);
-  let current = null;
-  try { current = fs.readFileSync(target, 'utf8'); } catch {}
-  if (current !== desired) {
-    const tmp = target + '.tmp';
-    fs.writeFileSync(tmp, desired);
-    fs.renameSync(tmp, target);
-    console.log(`[OK] Codex config written: ${target}`);
-  }
-  for (const [key, p] of Object.entries(config.providers)) {
-    if (!process.env[p.envKey]) {
-      console.warn(
-        `[WARN] provider "${key}" expects env var ${p.envKey}, but it is not set ` +
-        `(add it to bridge/.env)`,
-      );
-    }
   }
 }
 
@@ -1500,12 +1391,12 @@ function loadBridgeConfig() {
     proj.feishu.appSecretPath = resolvePath(proj.feishu.appSecretPath);
 
     // Per-project Codex overrides (all optional — defaults come from the
-    // top-level `codexDefaults` / generated config.toml). `provider` must
-    // reference a key in the top-level `providers` map (or a provider already
-    // defined in a hand-maintained config.toml).
+    // top-level `codexDefaults` / local Codex config.toml). Providers are
+    // configured in the local Codex config.toml.
     const cx = proj.codex || {};
     proj.codex = {
       model: cx.model || null,
+      reasoningEffort: cx.reasoningEffort || null,
       provider: cx.provider || null,
       sandbox: cx.sandbox || null,
       approvalPolicy: cx.approvalPolicy || null,
@@ -1518,84 +1409,23 @@ function loadBridgeConfig() {
     }
   }
 
-  // Model providers: defined once here, rendered into the managed
-  // ~/.codes/codex-home/config.toml ([model_providers.<key>]) on startup.
-  const providers = raw.providers || {};
-  // The key is interpolated as a TOML table name — restrict to bare keys so a
-  // dot/space can't silently produce a nested table or invalid TOML.
-  for (const [key, p] of Object.entries(providers)) {
-    if (!TOML_BARE_KEY_RE.test(key)) {
-      console.error(`[FATAL] providers key "${key}" must match ${TOML_BARE_KEY_RE} (letters/digits/_/-)`);
-      process.exit(1);
-    }
-    if (!p.baseUrl || !p.envKey) {
-      console.error(`[FATAL] providers.${key} needs "baseUrl" and "envKey" in bridge.json`);
-      process.exit(1);
-    }
-    if (p.wireApi && p.wireApi !== 'responses') {
-      console.error(`[FATAL] providers.${key}.wireApi must be "responses" (codex dropped "chat")`);
-      process.exit(1);
-    }
-  }
-  // Validate per-project provider references against the providers map.
-  for (const [alias, proj] of Object.entries(projects)) {
-    const prov = proj.codex.provider;
-    if (prov && !providers[prov]) {
-      console.error(`[FATAL] Project "${alias}" codex.provider "${prov}" not defined in providers`);
-      process.exit(1);
-    }
+  if (raw.providers || raw.mcpServers) {
+    console.warn('[WARN] bridge.json providers/mcpServers are no longer managed; configure them in your local Codex config.toml.');
   }
 
   const codexDefaults = {
     model: raw.codexDefaults?.model || null,
+    reasoningEffort: raw.codexDefaults?.reasoningEffort || null,
     provider: raw.codexDefaults?.provider || null,
     sandbox: raw.codexDefaults?.sandbox || CODEX_DEFAULT_SANDBOX,
     approvalPolicy: raw.codexDefaults?.approvalPolicy || CODEX_DEFAULT_APPROVAL,
     contextWindow: raw.codexDefaults?.contextWindow ? Number(raw.codexDefaults.contextWindow) : null,
     extraConfig: extractExtraCodexConfig(raw.codexDefaults, 'codexDefaults'),
   };
-  if (codexDefaults.provider && !providers[codexDefaults.provider]) {
-    console.error(`[FATAL] codexDefaults.provider "${codexDefaults.provider}" not defined in providers`);
-    process.exit(1);
-  }
-
-  // Backup config (optional — set to false to disable)
-  let backup;
-  if (raw.backup === false) {
-    backup = null;
-  } else {
-    const timeStr = String(raw.backup?.time ?? '04:16');
-    const m = timeStr.match(/^(\d{1,2}):(\d{2})$/);
-    if (!m) {
-      console.error(`[FATAL] backup.time 格式无效（应为 HH:MM）: ${timeStr}`);
-      process.exit(1);
-    }
-    const hour = Number(m[1]);
-    const minute = Number(m[2]);
-    if (hour > 23 || minute > 59) {
-      console.error(`[FATAL] backup.time 超出范围: ${timeStr}`);
-      process.exit(1);
-    }
-    backup = {
-      hour,
-      minute,
-      dest: resolvePath(String(raw.backup?.dest ?? '~/Backups')),
-    };
-  }
-
-  // MCP servers: passed through verbatim into config.toml [mcp_servers.<name>].
-  // Key names are interpolated as TOML table names, so restrict to bare keys.
-  const mcpServers = raw.mcpServers || {};
-  for (const [name, server] of Object.entries(mcpServers)) {
-    if (!TOML_BARE_KEY_RE.test(name)) {
-      console.error(`[FATAL] mcpServers key "${name}" must match ${TOML_BARE_KEY_RE} (letters/digits/_/-)`);
-      process.exit(1);
-    }
-    if (!server || typeof server !== 'object' || Array.isArray(server)) {
-      console.error(`[FATAL] mcpServers."${name}" must be an object`);
-      process.exit(1);
-    }
-  }
+  // Backups are manual and opt-in; there is no daily scheduler.
+  const backup = raw.backup && typeof raw.backup === 'object'
+    ? { dest: resolvePath(String(raw.backup.dest ?? '~/Backups')) }
+    : null;
 
   return {
     projects,
@@ -1603,9 +1433,7 @@ function loadBridgeConfig() {
       raw.thinkingThresholdMs ?? process.env.FEISHU_THINKING_THRESHOLD_MS ?? 2500,
     ),
     codexPath: raw.codexPath || 'codex',
-    providers,
     codexDefaults,
-    mcpServers,
     debug: raw.debug === true || DEBUG,
     backup,
   };
@@ -1617,13 +1445,12 @@ const SESSIONS_PATH = resolvePath('~/.codes/bridge-sessions.json');
 const SCHEDULED_PATH = resolvePath('~/.codes/bridge-scheduled.json');
 
 /** bridge.json codex keys with dedicated handling; everything else passes through verbatim. */
-const KNOWN_CODEX_KEYS = new Set(['model', 'provider', 'sandbox', 'approvalPolicy', 'contextWindow']);
+const KNOWN_CODEX_KEYS = new Set(['model', 'reasoningEffort', 'provider', 'sandbox', 'approvalPolicy', 'contextWindow']);
 const TOML_BARE_KEY_RE = /^[A-Za-z0-9_-]+$/;
 
 /**
  * Extract unknown codex.* keys for verbatim passthrough. Keys must be TOML bare
- * keys (they may be rendered into config.toml); values must be scalars or
- * arrays of scalars so both config.toml and thread/start config can carry them.
+ * keys; values must be scalars or arrays of scalars for thread/start config.
  */
 function extractExtraCodexConfig(source, where) {
   const extra = {};
@@ -1663,6 +1490,7 @@ class ProjectManager {
         codexPath: this._config.codexPath,
         threadId: sessionId,
         model: cx.model || defaults.model,
+        reasoningEffort: cx.reasoningEffort || defaults.reasoningEffort,
         provider: cx.provider || defaults.provider,
         sandbox: cx.sandbox || defaults.sandbox,
         approvalPolicy: cx.approvalPolicy || defaults.approvalPolicy,
@@ -1687,8 +1515,6 @@ class ProjectManager {
     this._saveInterval = setInterval(() => this._saveSessions(), 60_000);
     if (this._saveInterval.unref) this._saveInterval.unref();
 
-    this._scheduleBackup();
-
     // Save on process exit, kill all subprocesses
     const saveAndExit = async () => {
       this._saveSessions();
@@ -1710,6 +1536,8 @@ class ProjectManager {
     const proj = this._projects.get(alias);
     if (!proj) return { ok: false, error: `未知项目: ${alias}` };
     if (proj.started) return { ok: true, message: `${alias} 已在运行中` };
+    proj.agent._model = proj.agent._defaultModel;
+    proj.agent._reasoningEffort = proj.agent._defaultReasoningEffort;
     proj.agent.restart();
     proj.started = true;
     return { ok: true, message: `${alias} 已启动` };
@@ -1731,12 +1559,14 @@ class ProjectManager {
     await proj.agent.stop();
     proj.agent._sessionId = null;
     proj.agent._threadReady = false;
+    proj.agent._model = proj.agent._defaultModel;
+    proj.agent._reasoningEffort = proj.agent._defaultReasoningEffort;
     proj.agent._costUsd = 0;
     proj.agent._turnCount = 0;
     proj.agent.restart();
     proj.started = true;
     this._saveSessions();
-    return { ok: true, message: `${alias} 会话已重置，下次对话将开始新会话` };
+    return { ok: true, message: `${alias} 会话已重置，下次对话将开始新会话（${proj.agent._model || 'Codex 默认模型'} + ${proj.agent._reasoningEffort || '默认推理强度'}）` };
   }
 
   async startAll() {
@@ -1777,25 +1607,6 @@ class ProjectManager {
     return {};
   }
 
-  _scheduleBackup() {
-    const backup = this._config.backup;
-    if (!backup) return;
-
-    const { hour, minute, dest } = backup;
-    const delay = msUntilDailyTime(hour, minute);
-    const nextRun = new Date(Date.now() + delay);
-    console.log(
-      `[BACKUP] 已调度每日备份 ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}，` +
-      `下次执行: ${formatLocalDateTime(nextRun.toISOString())}，目标: ${dest}`,
-    );
-
-    this._backupTimer = setTimeout(async () => {
-      await this._runBackup(dest);
-      this._scheduleBackup(); // 次日同一时间再次执行
-    }, delay);
-    if (this._backupTimer.unref) this._backupTimer.unref();
-  }
-
   async _runBackup(dest) {
     const home = os.homedir();
     try {
@@ -1812,10 +1623,8 @@ class ProjectManager {
       .slice(0, 15);
     const outFile = path.join(dest, `backup_${timestamp}.tar.gz`);
 
-    // Collect targets. Everything the bridge owns lives under ~/.codes:
-    // bridge.json, secrets, models.json, and the managed Codex home
-    // (config.toml, rollouts, memories, skills). Logs and transient
-    // rebuildable state are excluded below.
+    // Manual backup covers bridge data and any retained legacy home in ~/.codes.
+    // The local Codex home (~/.codex) is independent and is not included.
     const targets = [];
     if (fs.existsSync(path.join(home, '.codes'))) targets.push('.codes');
 
@@ -2565,6 +2374,7 @@ async function handleSlashCommand(pm, alias, text) {
         '/status             — 查看所有项目状态',
         '/backup             — 立即触发一次备份',
         '/model [名称] [alias] — 查看或切换模型（如 glm-5.2 / qwen3.8-max）',
+        '/hard [alias]       — 切换到 gpt-6-astra + high（下次消息生效）',
         '/cost [alias]       — 查看 token 用量',
         '/context [alias]    — 查看上下文窗口占用',
         '/compact [alias]    — 压缩会话历史',
@@ -2586,7 +2396,7 @@ async function handleSlashCommand(pm, alias, text) {
   if (cmd === '/backup') {
     const backup = pm._config.backup;
     if (!backup) {
-      return { text: '备份未启用（bridge.json 中 backup 设为 false）。' };
+      return { text: '手动备份未启用；可在 bridge.json 中设置 backup.dest。' };
     }
     const result = await pm._runBackup(backup.dest);
     if (result.ok) {
@@ -2606,10 +2416,11 @@ async function handleSlashCommand(pm, alias, text) {
       const turns = info.turnCount > 0 ? `${info.turnCount}轮` : '';
       const session = info.sessionId ? `thread=${info.sessionId.slice(0, 8)}…` : '';
       const model = info.model ? `model=${info.model}` : '';
+      const effort = info.reasoningEffort ? `effort=${info.reasoningEffort}` : '';
       const queued = pendingMessages.has(a) ? '📨 有排队消息' : '';
       const scheduledCount = getScheduledJobCount(a);
       const scheduled = scheduledCount > 0 ? `⏰ ${scheduledCount}个定时` : '';
-      const details = [pid, model, tokens, turns, session, queued, scheduled].filter(Boolean).join(' ');
+      const details = [pid, model, effort, tokens, turns, session, queued, scheduled].filter(Boolean).join(' ');
       lines.push(`${flag} ${a} (${info.path})${details ? ' — ' + details : ''}`);
     }
     return { text: lines.join('\n') };
@@ -2701,6 +2512,19 @@ async function handleSlashCommand(pm, alias, text) {
     return { text: ok ? `已发送打断信号给 ${target}` : `${target} 当前没有在处理消息` };
   }
 
+  if (cmd === '/hard') {
+    const target = arg || alias;
+    const proj = pm.getProject(target);
+    if (!proj) return { text: `错误: 未知项目 ${target}` };
+    if (!proj.started) return { text: `项目 ${target} 未启动，请先 /start。` };
+    if (proj.agent.info().status === 'busy') {
+      return { text: `项目 ${target} 正在处理消息，请先等待完成或 /interrupt 打断后再切换模型。` };
+    }
+    proj.agent._model = 'gpt-6-astra';
+    proj.agent._reasoningEffort = 'high';
+    return { text: `✅ 项目 ${target} 已切换到 gpt-6-astra + high\n下次消息起生效。` };
+  }
+
   if (cmd === '/model') {
     const target = parts[2] || alias;
     const proj = pm.getProject(target);
@@ -2711,7 +2535,7 @@ async function handleSlashCommand(pm, alias, text) {
       const current = info.model || '(config.toml 默认)';
       const prov = info.provider || '(默认)';
       return {
-        text: `项目 ${target} 当前模型: ${current} (provider: ${prov})\n` +
+        text: `项目 ${target} 当前模型: ${current} (推理强度: ${info.reasoningEffort || '默认'}, provider: ${prov})\n` +
           '用法: /model <模型名> [alias]\n' +
           '示例: /model glm-5.2\n      /model qwen3.8-max',
       };
@@ -3873,23 +3697,61 @@ async function runSelfTest() {
   // 5) interrupt returns false when not busy
   ok('interrupt when idle', cp.interrupt() === false);
 
-  // 5b) managed codex config.toml generation
-  const toml = buildCodexConfigToml({
-    codexDefaults: {
-      model: 'glm-5.2', provider: 'maas', approvalPolicy: 'never', sandbox: 'danger-full-access',
-      contextWindow: null,
-      extraConfig: { model_reasoning_summary: 'none', model_reasoning_effort: 'xhigh', project_doc_fallback_filenames: ['CLAUDE.md'] },
-    },
-    providers: {
-      maas: { name: 'MaaS', baseUrl: 'https://example.com/v1', envKey: 'MAAS_API_KEY', wireApi: 'responses' },
-    },
+  // Defaults must not override local Codex settings in thread/start or resume.
+  const calls = [];
+  cp._sessionId = null;
+  cp._send = async (method, params) => {
+    calls.push({ method, params });
+    return { thread: { id: 'local-defaults-test' } };
+  };
+  await cp._ensureThread();
+  ok('thread/start inherits local defaults', JSON.stringify(calls[0]) === JSON.stringify({ method: 'thread/start', params: { cwd: '/tmp' } }));
+  cp._threadReady = false;
+  await cp._ensureThread();
+  ok('thread/resume inherits local defaults', JSON.stringify(calls[1]) === JSON.stringify({ method: 'thread/resume', params: { threadId: 'local-defaults-test', excludeTurns: true } }));
+  cp._threadReady = false;
+  cp._sandbox = 'read-only';
+  cp._approvalPolicy = 'on-request';
+  await cp._ensureThread();
+  ok('explicit thread overrides preserved', calls[2].params.sandbox === 'read-only' && calls[2].params.approvalPolicy === 'on-request');
+
+  // Model and effort move together for /hard; /reset and /start restore defaults.
+  const profileCalls = [];
+  const profileAgent = new CodexAppServer({
+    workDir: '/tmp', model: 'gpt-6-sol', reasoningEffort: 'xhigh',
   });
-  ok('toml: model', toml.includes('model = "glm-5.2"'));
-  ok('toml: provider ref', toml.includes('model_provider = "maas"'));
-  ok('toml: provider section', toml.includes('[model_providers.maas]') && toml.includes('env_key = "MAAS_API_KEY"'));
-  ok('toml: memories enabled', toml.includes('[features]') && toml.includes('memories = true'));
-  ok('toml: extra config passthrough', toml.includes('model_reasoning_summary = "none"') && toml.includes('model_reasoning_effort = "xhigh"'));
-  ok('toml: extra config array', toml.includes('project_doc_fallback_filenames = ["CLAUDE.md"]'));
+  profileAgent.start = async () => {};
+  profileAgent._send = async (method, params) => {
+    profileCalls.push({ method, params });
+    if (method === 'thread/start') return { thread: { id: 'profile-test' } };
+    if (method === 'turn/start') return { turn: { id: 'turn-test' } };
+    return { thread: { id: 'profile-test' } };
+  };
+  await profileAgent._ensureThread();
+  ok('new thread uses default model and effort',
+    profileCalls[0].params.model === 'gpt-6-sol'
+    && profileCalls[0].params.config.model_reasoning_effort === 'xhigh');
+  const profilePm = new ProjectManager({});
+  profilePm._saveSessions = () => {};
+  profilePm._projects.set('profile', { agent: profileAgent, started: true });
+  await handleSlashCommand(profilePm, 'profile', '/hard');
+  const hardTurn = profileAgent.sendMessage('hard task');
+  await new Promise((resolve) => setImmediate(resolve));
+  const hardParams = profileCalls.find((call) => call.method === 'turn/start')?.params;
+  ok('/hard applies Astra and high on next turn',
+    hardParams?.model === 'gpt-6-astra' && hardParams?.effort === 'high');
+  profileAgent._finishTurn({ status: 'completed' });
+  await hardTurn;
+  await profilePm.resetProject('profile');
+  await profileAgent._ensureThread();
+  const resetParams = profileCalls.filter((call) => call.method === 'thread/start').at(-1)?.params;
+  ok('/reset restores Sol and xhigh for a fresh thread',
+    resetParams?.model === 'gpt-6-sol' && resetParams?.config.model_reasoning_effort === 'xhigh');
+  await handleSlashCommand(profilePm, 'profile', '/hard');
+  await profilePm.stopProject('profile');
+  await profilePm.startProject('profile');
+  ok('/start restores default profile',
+    profileAgent.info().model === 'gpt-6-sol' && profileAgent.info().reasoningEffort === 'xhigh');
 
   // 6) pendingMessages single-slot queue
   pendingMessages.set('test', { text: 'a', chatId: 'c', channel: null, thresholdMs: 0 });
@@ -3984,8 +3846,7 @@ try {
   if (!SELFTEST) process.exit(1);
 }
 
-// Generate the managed Codex home (config.toml: providers, defaults, memories)
-ensureCodexHome(bridgeConfig);
+// Codex loads its own config, credentials, skills and memories.
 
 const pm = new ProjectManager(bridgeConfig);
 await pm.init();

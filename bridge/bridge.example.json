@@ -5,68 +5,14 @@
       "feishu": {
         "appId": "cli_xxx",
         "appSecretPath": "~/.codes/secrets/myapp_secret"
-      },
-      "codex": {
-        "model": "glm-5.2",
-        "provider": "maas"
-      }
-    },
-    "backend": {
-      "path": "/home/user/projects/backend",
-      "feishu": {
-        "appId": "cli_yyy",
-        "appSecretPath": "~/.codes/secrets/backend_secret"
-      },
-      "codex": {
-        "model": "qwen3.8-max",
-        "provider": "maas",
-        "contextWindow": 200000,
-        "model_reasoning_effort": "xhigh",
-        "model_reasoning_summary": "none"
-      }
-    },
-    "minimal": {
-      "path": "/home/user/projects/minimal",
-      "feishu": {
-        "appId": "cli_zzz",
-        "appSecretPath": "~/.codes/secrets/minimal_secret"
       }
     }
   },
-  "providers": {
-    "maas": {
-      "name": "Aliyun MaaS (OpenAI Responses compatible)",
-      "baseUrl": "https://your-gateway.example.com/compatible-mode/v1",
-      "envKey": "MAAS_API_KEY",
-      "wireApi": "responses"
-    }
-  },
-  "codexDefaults": {
-    "model": "glm-5.2",
-    "provider": "maas",
-    "contextWindow": 200000,
-    "project_doc_fallback_filenames": [
-      "CLAUDE.md"
-    ]
-  },
-  "thinkingThresholdMs": 2500,
   "codexPath": "codex",
-  "debug": false,
-  "backup": {
-    "time": "04:16",
-    "dest": "~/Backups"
+  "codexDefaults": {
+    "model": "gpt-6-sol",
+    "reasoningEffort": "xhigh"
   },
-  "mcpServers": {
-    "example-stdio": {
-      "command": "/absolute/path/to/npx",
-      "args": [
-        "-y",
-        "some-mcp-package"
-      ]
-    },
-    "example-http": {
-      "url": "https://mcp.example.com/v1",
-      "bearer_token_env_var": "EXAMPLE_MCP_TOKEN"
-    }
-  }
+  "debug": false,
+  "backup": false
 }

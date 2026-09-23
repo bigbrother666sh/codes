@@ -22,14 +22,11 @@ systemctl --user start codes-feishu-bridge.service     # 启动
 ```
 bridge.mjs (单 Node.js 进程)
 ├── loadBridgeConfig() — 读取 ~/.codes/bridge.json（projects/providers/codexDefaults）
-├── ensureCodexHome() — 从 bridge.json 生成 ~/.codes/codex-home/config.toml
-│     ├── [model_providers.*] — providers 映射（base_url + env_key + wire_api=responses）
-│     ├── [features] memories = true — codex 内置跨会话记忆管线
-│     └── 默认 model / model_provider / approval_policy / sandbox_mode
+├── 使用本机 Codex 默认配置与 CODEX_HOME，不生成 config.toml
 ├── CodexAppServer (每个项目一个) — 管理 codex app-server 子进程
 │     ├── start(): spawn codex app-server → initialize 握手 → initialized
 │     ├── _ensureThread(): thread/resume（有 threadId）或 thread/start；
-│     │     per-project 的 model/modelProvider/sandbox/approvalPolicy/contextWindow
+│     │     per-project 的 model/reasoningEffort/modelProvider/sandbox/approvalPolicy/contextWindow
 │     │     覆盖在此应用（contextWindow 走 thread 级 config.model_context_window）
 │     ├── sendMessage(): turn/start 发送用户消息 → 等待 turn/completed
 │     │     ├── item/agentMessage/delta — 流式增量（飞书打字机卡片）
@@ -53,11 +50,7 @@ bridge.mjs (单 Node.js 进程)
 
 ### 沙箱与审批姿态
 
-本机（及多数受限环境）无法创建 user namespace（AppArmor 限制），codex 的 bubblewrap 沙箱不可用。默认配置为 `sandbox: danger-full-access` + `approvalPolicy: never` —— 代理在受信服务器上自主执行，不弹审批。这与历史 Claude bridge 的 `--dangerously-skip-permissions` 姿态一致。若环境支持沙箱，可在 `bridge.json` 的 `codexDefaults` 或项目级 `codex` 改为 `workspace-write`。
-
-### 跨会话记忆
-
-codex 内置两阶段 memory 管线（会话结束后台提取结构化记忆 → 全局合并到 `$CODEX_HOME/memories/`，下次会话注入），由生成的 config.toml 中 `[features] memories = true` 启用。**无需外挂 memory MCP**。
+模型、沙箱、审批、MCP、skills 与记忆开关均由本机 Codex 管理。bridge 默认不覆盖这些配置；显式项目级 codex / codexDefaults 仍可覆盖线程参数。不会强制启用 memories。
 
 ## Key Files
 
@@ -71,15 +64,15 @@ codex 内置两阶段 memory 管线（会话结束后台提取结构化记忆 �
 
 ## Config
 
-- `~/.codes/bridge.json` — 项目配置（路径、飞书凭据、providers、codexDefaults、项目级 codex 覆盖：model/provider/sandbox/approvalPolicy/contextWindow）
+- `~/.codes/bridge.json` — 项目配置（路径、飞书凭据、可选 codexDefaults、项目级 codex 覆盖：model/reasoningEffort/provider/sandbox/approvalPolicy/contextWindow）
 - `~/.codes/bridge-sessions.json` — 会话持久化（自动管理；sessionId 即 codex thread id）
-- `~/.codes/codex-home/` — bridge 托管的 CODEX_HOME：config.toml（生成）、会话 rollout、memories
-- `bridge/.env` — 模型端点 API key（`providers.*.envKey` 对应变量）与可选调优变量
+- `~/.codex/`（或显式 CODEX_HOME）— 本机 Codex 配置、登录、会话和记忆；bridge 不改写配置
+- `bridge/.env` — 模型端点 API key（本机 Codex config.toml 的 env_key 对应变量）与可选调优变量
 
 ## Key Patterns
 
 - **app-server 协议**: `codex app-server` 的 JSON-RPC 2.0 stdio 模式。协议基线版本 0.152.1（`EXPECTED_CODEX_VERSION`），codex stable 2-4 天一版，升级后先跑 `--selftest` + 冒烟验证
-- **会话持久化**: thread id 即 session；codex rollout 落盘在 `~/.codes/codex-home/sessions/`，bridge 重启后 `thread/resume` 恢复；resume 失败（线程被删等）自动降级为新线程
+- **会话持久化**: thread id 即 session；codex rollout 落盘在 本机 Codex Home 的 `sessions/`，bridge 重启后 `thread/resume` 恢复；resume 失败（线程被删等）自动降级为新线程
 - **飞书流式回复**: `channel.stream({ markdown: producer })` 使用飞书原生 streaming card（打字机效果），SDK 自动处理 throttling 和 rollover（超 30KB 自动续接新卡片）
 - **过程卡只显示进度**: 最终结论一次性落卡（飞书流式卡编辑次数上限约 40 次的教训），进度编辑有 PROGRESS_EDIT_CAP，心跳 120s 一次
 - **processAndReply()**: 统一的 Codex→飞书回复函数，优先走 streaming 路径，stream 启动失败时 fallback 到非流式 sendReplyToFeishu()；表格多的结论 / 超长轮次绕过流式卡，另发普通卡片
@@ -88,10 +81,10 @@ codex 内置两阶段 memory 管线（会话结束后台提取结构化记忆 �
 - **打断机制**: `/interrupt` → `turn/interrupt`，8 秒看门狗兜底强制收尾
 - **服务端请求必应答**: 审批（item/commandExecution/requestApproval 等）、询问（item/tool/requestUserInput）、elicitation 全部自动应答（accept / 空答案 / decline），未知请求回 JSON-RPC error —— 任何情况下不让 turn 挂起
 - **多 bot 初始化**: 每个 feishu.appId 对应独立的 createLarkChannel 实例，一个 bridge 进程可服务多个飞书 bot
-- **飞书命令**: `/start`, `/stop`, `/reset`, `/interrupt`, `/model`, `/cost`, `/context`, `/compact`, `/status`, `/backup`, `/scheduled`, `/unschedule`, `/help` — 未识别的斜杠命令作为普通消息转发给 Codex
+- **飞书命令**: `/start`, `/stop`, `/reset`, `/interrupt`, `/model`, `/hard`, `/cost`, `/context`, `/compact`, `/status`, `/backup`, `/scheduled`, `/unschedule`, `/help` — 未识别的斜杠命令作为普通消息转发给 Codex
 - **延迟发送**: `/小时-分钟 "要延迟发送的消息"` 定时发给 Codex
 - **immutable config**: 配置在启动时加载，运行时不修改原始对象
-- **备份**: 每日自动打包 `~/.codes`（含 codex-home 的会话与记忆），排除 logs 与 bridge-sessions.json
+- **备份**: 无每日调度，默认关闭；显式配置 backup.dest 后可通过 /backup 手动打包 .codes，不包含 ~/.codex
 
 ## CI
 

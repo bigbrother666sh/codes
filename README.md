@@ -21,7 +21,7 @@
 
 🚀【2026.9.2】**基座切换为 Codex**：bridge 通过 `codex app-server`（JSON-RPC over stdio）完整桥接 Codex 的 IO——流式增量文本、打断、跨进程会话恢复、审批应答、token 统计。
 
-🚀 每日自动备份，`/backup` 命令可随时手动触发
+🚀 直接复用本机 Codex 配置、登录与 skills，无需单独配置模型
 
 🚀 延迟消息（计划消息）：`/小时-分钟 “要延迟发送的消息”`（xx 小时 xx 分钟后，内容发给 Codex）
 
@@ -48,7 +48,7 @@
 - **bridge.mjs** — 单 Node.js 进程，同时服务多个飞书 bot + 多个 Codex 子进程
 - **CodexAppServer** — 每个项目一个 `codex app-server` 子进程：`initialize` 握手 → `thread/start`（新会话）或 `thread/resume`（恢复会话）→ `turn/start` 发消息，`item/agentMessage/delta` 流式增量 → 飞书打字机卡片；`turn/interrupt` 打断；所有服务端请求（审批等）自动应答，绝不挂起
 - **ProjectManager** — 管理多项目生命周期，每个项目独立的 Codex 实例和飞书 bot
-- **托管 Codex Home** — bridge 启动时从 `bridge.json` 生成 `~/.codes/codex-home/config.toml`（providers、默认模型、内置 memory 开关），会话数据与记忆都落在 `~/.codes` 内，自动进入每日备份
+- **本机 Codex** — 继承本机默认配置与 `CODEX_HOME`（通常为 `~/.codex`），不生成或覆盖 Codex 配置。`.codes` 只保存 bridge 配置、飞书凭据、日志和会话映射。
 - **createLarkChannel** — 飞书 SDK 1.66+ 高层 API，封装 WebSocket 连接、消息归一化、流式卡片、卡片交互回调
 
 ### 飞书 SDK 能力
@@ -65,10 +65,10 @@
 
 ## 前置要求
 
-- **Node.js** 18+（推荐 22+）
+- **Node.js** 22+
 - **@larksuiteoapi/node-sdk** 1.66.0（飞书 SDK，bridge 自带）
 - **Codex CLI** — `npm install -g @openai/codex`（协议基线版本：0.152.1）
-- **一个 OpenAI Responses 兼容的模型端点** + API key
+- **本机 Codex 已配置并能正常使用**（登录或模型端点配置均由 Codex 管理）
 - **飞书自建应用** — 需要 App ID + App Secret（详见下方配置步骤）
 
 ## 快速开始
@@ -102,18 +102,6 @@ cp bridge.example.json ~/.codes/bridge.json
       }
     }
   },
-  "providers": {
-    "maas": {
-      "name": "我的模型网关",
-      "baseUrl": "https://your-gateway.example.com/compatible-mode/v1",
-      "envKey": "MAAS_API_KEY",
-      "wireApi": "responses"
-    }
-  },
-  "codexDefaults": {
-    "model": "glm-5.2",
-    "provider": "maas"
-  },
   "codexPath": "codex",
   "debug": false
 }
@@ -126,12 +114,9 @@ echo -n "your-app-secret" > ~/.codes/secrets/myapp_secret
 chmod 600 ~/.codes/secrets/myapp_secret
 ```
 
-将模型端点的 API key 写入 `bridge/.env`（变量名对应 `providers.*.envKey`）：
+先在终端确认 `codex` 能正常工作。bridge 使用同一套 Codex 配置、登录、MCP 和记忆设置。
 
-```bash
-echo 'MAAS_API_KEY=sk-xxxx' > bridge/.env
-chmod 600 bridge/.env
-```
+在仓库根目录运行 `./deploy.sh` 可安装 bridge 依赖并启用用户服务；已有 `~/.codes/bridge.json` 会直接复用，不覆盖项目和凭据。脚本不安装或重新配置 Codex。
 
 ### 3. 启动
 
@@ -149,39 +134,20 @@ node bridge.mjs
 | `projects.*.path` | 项目代码仓路径 | 必填 |
 | `projects.*.feishu.appId` | 飞书 App ID | 必填 |
 | `projects.*.feishu.appSecretPath` | Secret 文件路径 | 必填 |
-| `projects.*.codex.model` | 该项目的模型（覆盖默认） | `codexDefaults.model` |
-| `projects.*.codex.provider` | 该项目的 provider（须引用 `providers` 中的 key） | `codexDefaults.provider` |
-| `projects.*.codex.sandbox` | 沙箱模式（`read-only` / `workspace-write` / `danger-full-access`） | `danger-full-access` |
-| `projects.*.codex.contextWindow` | 该项目的上下文窗口（token，影响自动压缩时机；实际可用约为配置值的 95%） | `codexDefaults.contextWindow` |
-| `projects.*.codex.*` | 其余任意 codex 配置键（snake_case，如 `model_reasoning_summary`、`model_reasoning_effort`）原样透传给该项目会话（thread/start config，优先级最高） | `codexDefaults.*` |
-| `providers.<key>.baseUrl` | Responses 兼容端点（`/responses` 会自动拼接） | 必填 |
-| `providers.<key>.envKey` | 存放 API key 的环境变量名 | 必填 |
-| `providers.<key>.wireApi` | 协议（仅支持 `responses`） | `"responses"` |
-| `codexDefaults.model` / `.provider` | 全局默认模型 / provider | — |
-| `codexDefaults.contextWindow` | 上下文窗口大小（token） | — |
-| `codexDefaults.*` | 其余任意 codex 配置键（snake_case）渲染进 `config.toml`（全局默认，项目级同名键可覆盖） | — |
-| `thinkingThresholdMs` | thinking 状态提示阈值（ms） | 2500 |
-| `codexPath` | codex CLI 路径（systemd 下建议绝对路径） | `"codex"` |
+| `codexPath` | 本机 codex CLI 路径，服务中建议使用绝对路径 | `"codex"` |
+| `thinkingThresholdMs` | 进度提示阈值（ms） | 2500 |
 | `debug` | 调试模式 | `false` |
-| `backup.time` | 每日自动备份时间（HH:MM） | `"04:16"` |
-| `backup.dest` | 备份目标目录 | `"~/Backups"` |
-| `backup` | 设为 `false` 可完全禁用自动备份 | — |
+| `backup` | 可选手动备份配置（如 `{ "dest": "~/Backups" }`） | `false` |
 
-### 沙箱与审批
+默认不传模型、推理强度、provider、沙箱、审批或上下文配置覆盖，全部由本机 Codex 决定。可通过 `codexDefaults.model` 和 `codexDefaults.reasoningEffort` 设置所有项目的新会话及 `/reset` 默认值，例如 `gpt-6-sol` 和 `xhigh`；`projects.*.codex` 可覆盖单个项目。provider 必须已在本机 Codex 中定义。旧的 `providers`、`mcpServers` 字段不再生成配置，需要在本机 Codex 中维护。
 
-本机环境若无法创建 user namespace（常见于 AppArmor 限制的 Ubuntu），codex 的 bubblewrap 沙箱不可用，默认配置为 `danger-full-access` + `approvalPolicy: never`（代理在受信服务器上自主执行，与多数生产部署姿态一致）。若你的环境支持沙箱，可在 `codexDefaults` / 项目级 `codex` 里改成 `workspace-write`。
+bridge 不再安排每日备份。仅显式配置 `backup.dest` 后，`/backup` 才能手动打包 `.codes`；它不包含默认 `~/.codex`。
 
-### 第三方模型的上下文窗口上限
-
-`model_context_window` 会受模型元数据里 `max_context_window` 的硬性钳制。Codex 不认识的模型（如 GLM、Qwen）会落入 fallback 元数据（上限 272k，可用约 258k），配置 1M 也会被钳到 272k。解决办法：提供一个自定义模型目录（`models.json`，含 `context_window` / `max_context_window` / `model_messages.instructions_template`），并在 `codexDefaults` 里设 `model_catalog_json = "/path/to/models.json"`（全局生效，重启 bridge 后渲染进 config.toml）。注意该目录会**替换**内置目录，需要把所有在用的第三方模型都列进去。
-
-### 自动备份
-
-bridge 内置每日定时备份，默认凌晨 04:16 将 `~/.codes` 的核心内容（bridge.json、secrets、models.json、codex-home 的 config/sessions/memories/skills）打包为 `backup_YYYYMMDD_HHmm.tar.gz`。排除项：`logs/`、`bridge-sessions.json`、codex-home 的插件同步缓存（`.tmp/`，可按需重建）、内部日志库（`logs_2.sqlite*`）、运行时临时目录、以及 SQLite 的 `-wal`/`-shm` 活动侧车文件（运行中打包不安全；主 `.sqlite` 保留最近检查点）。设为 `false` 可禁用；飞书发 `/backup` 随时手动触发。
+已有 `.codes/codex-home` 不会删除或迁移。旧线程不在当前 Codex Home 时，恢复失败会新建线程；旧历史仍留在原目录。
 
 ### .env 调优（可选）
 
-参见 `bridge/.env.example`。模型端点 API key（`providers.*.envKey` 对应的变量）也放在这里。
+参见 `bridge/.env.example`。用户服务如需额外环境变量，可放在 `~/.codes/bridge.env`；bridge 自身也会加载 `bridge/.env`。模型配置和登录由本机 Codex 管理。
 
 ### 飞书自建应用创建步骤
 
@@ -232,9 +198,10 @@ bridge 内置每日定时备份，默认凌晨 04:16 将 `~/.codes` 的核心内
 |------|------|
 | `/start [alias\|all]` | 启动项目的 Codex 会话 |
 | `/stop [alias\|all]` | 停止项目的 Codex 会话 |
-| `/reset [alias]` | 重置会话（清除历史，开始新对话） |
+| `/reset [alias]` | 重置会话并恢复项目默认模型和推理强度 |
 | `/interrupt [alias]` | 打断当前正在处理的消息 |
 | `/model [名称] [alias]` | 查看或切换模型（下一条消息生效） |
+| `/hard [alias]` | 切换到 `gpt-6-astra` + `high`（下一条消息生效） |
 | `/cost [alias]` | 查看 token 用量（累计/上一轮） |
 | `/context [alias]` | 查看上下文窗口占用 |
 | `/compact [alias]` | 压缩会话历史 |
@@ -244,6 +211,7 @@ bridge 内置每日定时备份，默认凌晨 04:16 将 `~/.codes` 的核心内
 
 其他 `/` 开头的消息会作为普通消息转发给 Codex。
 普通消息直接发送给对应项目的 Codex 处理。
+项目停止后再次 `/start` 也会恢复默认模型和推理强度，但保留会话历史。
 
 ### 消息队列与打断
 
