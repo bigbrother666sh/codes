@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(journalctl *)",
+      "Read(//usr/bin/**)",
+      "Read(//usr/local/bin/**)",
+      "Read(//home/wukong/**)",
+      "Read(//usr/local/lib/**)",
+      "Read(//usr/local/**)",
+      "Read(//opt/**)",
+      "Bash(systemctl --user daemon-reload)",
+      "Bash(systemctl --user restart codes-feishu-bridge.service)",
+      "Bash(systemctl --user status codes-feishu-bridge.service)",
+      "Bash(systemctl --user status codes-feishu-bridge.service --no-pager)",
+      "Bash(dpkg -l)",
+      "Bash(apt list *)",
+      "Bash(sudo apt *)",
+      "Bash(systemctl --user is-active codes-feishu-bridge.service)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(echo \"active-exit=$?\")",
+      "Bash(systemctl --user is-failed codes-feishu-bridge.service)",
+      "Bash(echo \"failed-exit=$?\")",
+      "Bash(node --check bridge.mjs)",
+      "Bash(node bridge/bridge.mjs --selftest)",
+      "Bash(node --check bridge/bridge.mjs)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('sessions:', json.dumps\\(d, ensure_ascii=False\\)[:800]\\)\")",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(systemctl --user status codes-feishu-bridge.service --no-pager -l)",
+      "Bash(git -C /home/wukong/codes log --oneline -5)",
+      "Bash(git -C /home/wukong/codes status --short)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(p.get\\('alias'\\), '->', p.get\\('backend','claude'\\), 'port=', p.get\\('atomcode',{}\\).get\\('port'\\)\\) for p in d.get\\('projects',[]\\)]\")",
+      "Bash(python3 *)",
+      "Bash(node --check /home/wukong/codes/bridge/setup-service.mjs)",
+      "Bash(node --check /home/wukong/codes/bridge/bridge.mjs)",
+      "Bash(git push *)"
+    ]
+  }
+}

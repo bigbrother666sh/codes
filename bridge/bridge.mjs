@@ -171,7 +171,7 @@ let DEBUG = process.env.FEISHU_BRIDGE_DEBUG === '1';
 const BRIDGE_VERSION = readBridgeVersion();
 // Protocol-tested codex CLI version. app-server protocol churns fast
 // (stable releases every 2-4 days); a mismatch is a warning, not fatal.
-const EXPECTED_CODEX_VERSION = '0.159.2';
+const EXPECTED_CODEX_VERSION = '0.164.0';
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
@@ -571,7 +571,7 @@ function cleanupTempFile(filePath) {
 // Bridges one Codex CLI `app-server` subprocess (JSON-RPC 2.0 over stdio,
 // newline-delimited JSON) to a Feishu project. One process per conversation.
 //
-// Wire protocol (validated against codex-cli 0.159.2):
+// Wire protocol (validated against codex-cli 0.164.0):
 //   → initialize + initialized          handshake, once per connection
 //   → thread/start | thread/resume      open / continue a thread; the
 //                                       thread id IS the persisted session
@@ -748,7 +748,7 @@ class CodexAppServer {
       ...(this._provider ? { modelProvider: this._provider } : {}),
       ...(this._approvalPolicy ? { approvalPolicy: this._approvalPolicy } : {}),
       ...(this._sandbox ? { sandbox: this._sandbox } : {}),
-      // Free-form config overrides (validated against codex 0.159.2): applied
+      // Free-form config overrides (validated against codex 0.164.0): applied
       // per thread via the `config` object, which codex merges as top-level
       // config overrides (higher precedence than config.toml). The effective
       // usable context window is the configured value minus codex headroom (~95%).
@@ -1394,6 +1394,10 @@ function loadBridgeConfig() {
       process.exit(1);
     }
     proj.feishu.appSecretPath = resolvePath(proj.feishu.appSecretPath);
+    if (proj.feishu.allowGroupChats != null && typeof proj.feishu.allowGroupChats !== 'boolean') {
+      console.error(`[FATAL] Project "${alias}" feishu.allowGroupChats must be a boolean`);
+      process.exit(1);
+    }
 
     // Per-project Codex overrides (all optional — defaults come from the
     // top-level `codexDefaults` / local Codex config.toml). Providers are
@@ -1523,6 +1527,7 @@ class ProjectManager {
   getConversation(projectAlias, chatType, chatId) {
     const config = this._config.projects[projectAlias];
     if (!config || !['group', 'p2p'].includes(chatType) || !chatId) return null;
+    if (chatType === 'group' && config.feishu.allowGroupChats === false) return null;
     const base = this._projects.get(projectAlias);
     // Preserve the old alias/thread for the first private conversation.
     // Every group uses a separate instance of this same project's config.
@@ -1548,7 +1553,8 @@ class ProjectManager {
   resolveTarget(currentAlias, target) {
     const current = this.getProject(currentAlias);
     if (!current?.chatId || !this._config.projects?.[target]) return target;
-    return this.getConversation(target, current.chatType, current.chatId).alias;
+    return this.getConversation(target, current.chatType, current.chatId)?.alias
+      || conversationKey(target, current.chatType, current.chatId);
   }
 
   _restoreProjects(saved) {
@@ -1563,7 +1569,19 @@ class ProjectManager {
       if (this._projects.has(alias) || !this._config.projects[state.projectAlias]
         || !state.chatId || !['p2p', 'group'].includes(state.chatType)
         || alias !== conversationKey(state.projectAlias, state.chatType, state.chatId)) continue;
+      if (state.chatType === 'group'
+        && this._config.projects[state.projectAlias].feishu.allowGroupChats === false) continue;
       this._createProject(alias, state.projectAlias, state);
+    }
+  }
+
+  _clearDisabledGroupMessages() {
+    for (const [projectAlias, config] of Object.entries(this._config.projects)) {
+      if (config.feishu.allowGroupChats !== false) continue;
+      const prefix = conversationKey(projectAlias, 'group', '');
+      for (const key of this.groupMessages.messages.keys()) {
+        if (key.startsWith(prefix)) this.groupMessages.clear(key);
+      }
     }
   }
 
@@ -1572,6 +1590,8 @@ class ProjectManager {
     this.notices = new BridgeNoticeRegistry(resolvePath('~/.codes/bridge-notices.json'));
     this.groupMessages = new GroupMessageBuffer(resolvePath('~/.codes/bridge-group-messages.json'));
     this.groupMessages.prune((record) => this.notices.has(record.messageId));
+    this._clearDisabledGroupMessages();
+    this._saveSessions();
 
     // Auto-save sessions every 60s
     this._saveInterval = setInterval(() => this._saveSessions(), 60_000);
@@ -4103,6 +4123,58 @@ async function runSelfTest() {
     chatId: 'shared-room', raw: { sender: { sender_type: 'user' } },
   }));
   ok('user quotes of control replies are preserved', conversationPm.groupMessages.count(sharedXiaobei.alias) === 2);
+
+  const privateOnlyConfig = {
+    ...conversationConfig,
+    projects: {
+      ...conversationConfig.projects,
+      codes: { path: '/tmp', feishu: { appId: 'private-only-bot', allowGroupChats: false } },
+    },
+  };
+  const privateOnlyPm = new ProjectManager(privateOnlyConfig);
+  privateOnlyPm._saveSessions = () => {};
+  const disabledGroup = conversationKey('codes', 'group', 'group-1');
+  privateOnlyPm._restoreProjects({
+    ...snapshot,
+    codes: { sessionId: 'codes-private-thread', chatType: 'p2p', chatId: 'codes-private' },
+    [disabledGroup]: { projectAlias: 'codes', chatType: 'group', chatId: 'group-1', sessionId: 'codes-group-thread' },
+  });
+  ok('disabling group chats removes saved group bindings and preserves private and other bots sessions',
+    !privateOnlyPm.getProject(disabledGroup)
+    && privateOnlyPm.getProject('codes').agent.info().sessionId === 'codes-private-thread'
+    && privateOnlyPm.getProject(groupChat.alias).agent.info().sessionId === `${groupChat.alias}-thread`);
+  privateOnlyPm.groupMessages.append(disabledGroup, groupMessageRecord(message('旧群背景')));
+  privateOnlyPm.groupMessages.append(groupChat.alias, groupMessageRecord(message('保留其他 bot 背景')));
+  privateOnlyPm._clearDisabledGroupMessages();
+  ok('disabling group chats clears only that projects buffered group messages',
+    !privateOnlyPm.groupMessages.messages.has(disabledGroup)
+    && privateOnlyPm.groupMessages.count(groupChat.alias) === 1);
+  const privateOnlySends = [];
+  const privateOnlyTurns = [];
+  const privateOnlyChannel = {
+    ...fakeChannel,
+    async send(chatId, input) { privateOnlySends.push({ chatId, input }); return {}; },
+    async stream(chatId, input) { privateOnlySends.push({ chatId }); await input.markdown(controller()); return {}; },
+  };
+  const privateOnlyHandler = createNormalizedMessageHandler(privateOnlyPm, 'codes', privateOnlyChannel, 0);
+  for (const incoming of [message('背景'), message('@ 你', { mentionedBot: true }), message('/clear')]) {
+    await privateOnlyHandler(incoming);
+  }
+  ok('disabled group input cannot recreate a session, accumulate messages, or send command replies',
+    !privateOnlyPm.getProject(disabledGroup) && privateOnlySends.length === 0
+    && privateOnlyPm.groupMessages.count(disabledGroup) === 0
+    && privateOnlyPm.getProject('codes').agent.info().sessionId === 'codes-private-thread');
+  privateOnlyPm.getProject('codes').agent.sendMessage = async (text) => {
+    privateOnlyTurns.push(text);
+    return { text: '私聊正常' };
+  };
+  await privateOnlyHandler(message('私聊请求', { chatType: 'p2p', chatId: 'codes-private' }));
+  ok('private conversations still work when group chats are disabled',
+    privateOnlyTurns[0] === '私聊请求' && privateOnlySends.length === 1);
+  ok('cross-project commands and schedules cannot recreate a disabled group or target its private session',
+    privateOnlyPm.resolveTarget(groupChat.alias, 'codes') === disabledGroup
+    && !privateOnlyPm.getProject(disabledGroup)
+    && await resolveScheduledConversation(privateOnlyPm, 'codes', { chatId: 'group-1', chatType: 'group' }, {}) === null);
 
   console.log('[OK] Selftests finished');
 }

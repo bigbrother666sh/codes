@@ -61,7 +61,7 @@
 
 - **Node.js** 22+
 - **@larksuiteoapi/node-sdk** 1.66.0（飞书 SDK，bridge 自带）
-- **Codex CLI** — `npm install -g @openai/codex`（协议基线版本：0.159.2）
+- **Codex CLI** — `npm install -g @openai/codex`（协议基线版本：0.164.0）
 - **本机 Codex 已配置并能正常使用**（登录或模型端点配置均由 Codex 管理）
 - **飞书自建应用** — 需要 App ID + App Secret（详见下方配置步骤）
 
@@ -128,6 +128,7 @@ node bridge.mjs
 | `projects.*.path` | 项目代码仓路径 | 必填 |
 | `projects.*.feishu.appId` | 飞书 App ID | 必填 |
 | `projects.*.feishu.appSecretPath` | Secret 文件路径 | 必填 |
+| `projects.*.feishu.allowGroupChats` | 是否接入群聊；设为 `false` 时仅接入私聊，启动时移除该项目的群会话映射和未发送背景 | `true` |
 | `codexPath` | 本机 codex CLI 路径，服务中建议使用绝对路径 | `"codex"` |
 | `thinkingThresholdMs` | 进度提示阈值（ms） | 2500 |
 | `debug` | 调试模式 | `false` |
@@ -142,6 +143,8 @@ bridge 不再安排每日备份。仅显式配置 `backup.dest` 后，`/backup` 
 ### 项目 Bot 与群聊通道
 
 每个项目绑定自己的 Bot App ID 和 Secret。群聊、私聊都使用这个 bot 对应的项目目录与默认 Codex 配置；每个聊天会话有独立的进程和 thread。将多个项目 bot 拉入同一个群后，它们继续代表各自的项目。
+
+仅需私聊的 bot 可在该项目的 `feishu` 配置中设置 `"allowGroupChats": false`。该 bot 会忽略群里的所有输入，包括 @ 和 Slash 命令；启动时清理已有群会话映射和未发送背景，私聊历史保留。
 
 例如小贝开发与 relay 运维：
 

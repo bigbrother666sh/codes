@@ -76,7 +76,7 @@ bridge.mjs (单 Node.js 进程)
 
 ## Key Patterns
 
-- **app-server 协议**: `codex app-server` 的 JSON-RPC 2.0 stdio 模式。协议基线版本 0.159.2（`EXPECTED_CODEX_VERSION`），codex stable 2-4 天一版，升级后先跑 `--selftest` + 冒烟验证
+- **app-server 协议**: `codex app-server` 的 JSON-RPC 2.0 stdio 模式。协议基线版本 0.164.0（`EXPECTED_CODEX_VERSION`），codex stable 2-4 天一版，升级后先跑 `--selftest` + 冒烟验证
 - **会话持久化**: thread id 即 session；codex rollout 落盘在 本机 Codex Home 的 `sessions/`，bridge 重启后 `thread/resume` 恢复；resume 失败（线程被删等）自动降级为新线程
 - **飞书流式回复**: `channel.stream({ markdown: producer })` 使用飞书原生 streaming card（打字机效果），SDK 自动处理 throttling 和 rollover（超 30KB 自动续接新卡片）
 - **过程卡只显示进度**: 最终结论一次性落卡（飞书流式卡编辑次数上限约 40 次的教训），进度编辑有 PROGRESS_EDIT_CAP，心跳 120s 一次
@@ -87,6 +87,7 @@ bridge.mjs (单 Node.js 进程)
 - **服务端请求必应答**: 审批（item/commandExecution/requestApproval 等）、询问（item/tool/requestUserInput）、elicitation 全部自动应答（accept / 空答案 / decline），未知请求回 JSON-RPC error —— 任何情况下不让 turn 挂起
 - **群聊累积与会话隔离**: 群聊普通消息只响应 @ 当前机器人，其他普通消息带发信人/时间/正文逐条落盘到 `~/.codes/bridge-group-messages.json`；@ 时取出背景与当前请求拼接，提交失败恢复。Slash 命令无需 @，收到后直接执行；`/clear` 和 `/reset` 同时清空未发送给 AI 的积累及待处理请求，其他管理命令保留背景。未 @ 的未知 Slash 命令直接转给 Codex并保留积累，带 @ 则一起发送背景。每个群与每个私聊独立 CodexAppServer/thread/队列，首个私聊保留旧 alias/thread；每个 bot 固定绑定一个项目及其目录/默认 Codex 配置，群聊和私聊只是输入输出通道；无需为群聊另配项目条目，每个群聊自动使用 `alias:group:chat_id` 运行时标识。同群多 bot 各自积累并只响应 @ 自己的普通消息，各 bot 建立独立的 WebSocket。AI 忙碌时 @ 请求优先 `turn/steer` 并入当前轮次，失败时合并排队，保留每批背景与请求。
 - **多 bot 初始化**: 每个 feishu.appId 对应独立的 createLarkChannel 实例及 `new Lark.DefaultCache()`。SDK 默认使用进程共享缓存，消息去重键不含 appId，同群多个 bot 会误丢彼此已经处理的消息；不能省略独立 cache。SDK 的 @all 过滤放开，由 bridge 自身决定仅累积或响应。自测包含真实 SDK 归一化/去重入口。
+- **仅私聊项目**: `projects.*.feishu.allowGroupChats=false` 会忽略该项目全部群输入（含 @、Slash 和定时恢复），启动时移除已保存的群会话映射及未发送背景；私聊与其他项目不受影响。未配置时默认允许群聊。
 - **群聊回执过滤**: bot 自身消息直接跳过；bridge 命令回执、排队/steer 提示、定时通知和普通文本进度在发送时标记，所有 bot 按同一消息 ID 排除。事件先于发送响应时，仅匹配当前群正在发送的完整回执/文本分片且 sender_type=app；用户引用相同文字及其他 bot 的 AI 回复保留。已登记回执如遗留在群缓冲，启动时清理；不在服务运行中直接改写缓冲文件。
 - **飞书命令**: `/start`, `/stop`, `/reset`, `/interrupt`, `/model`, `/hard`, `/cost`, `/context`, `/compact`, `/status`, `/backup`, `/scheduled`, `/unschedule`, `/help` — 未识别的斜杠命令作为普通消息转发给 Codex
 - **延迟发送**: `/小时-分钟 "要延迟发送的消息"` 定时发给 Codex
