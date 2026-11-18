@@ -171,7 +171,7 @@ let DEBUG = process.env.FEISHU_BRIDGE_DEBUG === '1';
 const BRIDGE_VERSION = readBridgeVersion();
 // Protocol-tested codex CLI version. app-server protocol churns fast
 // (stable releases every 2-4 days); a mismatch is a warning, not fatal.
-const EXPECTED_CODEX_VERSION = '0.164.0';
+const EXPECTED_CODEX_VERSION = '0.169.0';
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
@@ -571,7 +571,7 @@ function cleanupTempFile(filePath) {
 // Bridges one Codex CLI `app-server` subprocess (JSON-RPC 2.0 over stdio,
 // newline-delimited JSON) to a Feishu project. One process per conversation.
 //
-// Wire protocol (validated against codex-cli 0.164.0):
+// Wire protocol (validated against codex-cli 0.169.0):
 //   → initialize + initialized          handshake, once per connection
 //   → thread/start | thread/resume      open / continue a thread; the
 //                                       thread id IS the persisted session
@@ -748,7 +748,7 @@ class CodexAppServer {
       ...(this._provider ? { modelProvider: this._provider } : {}),
       ...(this._approvalPolicy ? { approvalPolicy: this._approvalPolicy } : {}),
       ...(this._sandbox ? { sandbox: this._sandbox } : {}),
-      // Free-form config overrides (validated against codex 0.164.0): applied
+      // Free-form config overrides (validated against codex 0.169.0): applied
       // per thread via the `config` object, which codex merges as top-level
       // config overrides (higher precedence than config.toml). The effective
       // usable context window is the configured value minus codex headroom (~95%).
@@ -1371,6 +1371,11 @@ function loadBridgeConfig() {
     console.error('[FATAL] No projects defined in bridge.json');
     process.exit(1);
   }
+  if (raw.disabledGroupChats != null && (!Array.isArray(raw.disabledGroupChats)
+    || raw.disabledGroupChats.some((id) => typeof id !== 'string' || !id.trim()))) {
+    console.error('[FATAL] disabledGroupChats must be an array of non-empty chat ID strings');
+    process.exit(1);
+  }
 
   // Validate each project
   for (const [alias, proj] of Object.entries(projects)) {
@@ -1445,6 +1450,7 @@ function loadBridgeConfig() {
 
   return {
     projects,
+    disabledGroupChats: raw.disabledGroupChats || [],
     thinkingThresholdMs: Number(
       raw.thinkingThresholdMs ?? process.env.FEISHU_THINKING_THRESHOLD_MS ?? 2500,
     ),
@@ -1490,6 +1496,7 @@ function extractExtraCodexConfig(source, where) {
 class ProjectManager {
   constructor(config) {
     this._config = config;
+    this._disabledGroupChats = new Set(config.disabledGroupChats || []);
     /** @type {Map<string, {agent: CodexAppServer, started: boolean, path: string, feishuAppId: string}>} */
     this._projects = new Map();
     this.groupMessages = new GroupMessageBuffer();
@@ -1524,10 +1531,15 @@ class ProjectManager {
     return instance;
   }
 
+  _isGroupDisabled(projectAlias, chatId) {
+    return this._disabledGroupChats.has(chatId)
+      || this._config.projects[projectAlias]?.feishu.allowGroupChats === false;
+  }
+
   getConversation(projectAlias, chatType, chatId) {
     const config = this._config.projects[projectAlias];
     if (!config || !['group', 'p2p'].includes(chatType) || !chatId) return null;
-    if (chatType === 'group' && config.feishu.allowGroupChats === false) return null;
+    if (chatType === 'group' && this._isGroupDisabled(projectAlias, chatId)) return null;
     const base = this._projects.get(projectAlias);
     // Preserve the old alias/thread for the first private conversation.
     // Every group uses a separate instance of this same project's config.
@@ -1569,18 +1581,18 @@ class ProjectManager {
       if (this._projects.has(alias) || !this._config.projects[state.projectAlias]
         || !state.chatId || !['p2p', 'group'].includes(state.chatType)
         || alias !== conversationKey(state.projectAlias, state.chatType, state.chatId)) continue;
-      if (state.chatType === 'group'
-        && this._config.projects[state.projectAlias].feishu.allowGroupChats === false) continue;
+      if (state.chatType === 'group' && this._isGroupDisabled(state.projectAlias, state.chatId)) continue;
       this._createProject(alias, state.projectAlias, state);
     }
   }
 
   _clearDisabledGroupMessages() {
-    for (const [projectAlias, config] of Object.entries(this._config.projects)) {
-      if (config.feishu.allowGroupChats !== false) continue;
+    for (const projectAlias of Object.keys(this._config.projects)) {
       const prefix = conversationKey(projectAlias, 'group', '');
       for (const key of this.groupMessages.messages.keys()) {
-        if (key.startsWith(prefix)) this.groupMessages.clear(key);
+        if (key.startsWith(prefix) && this._isGroupDisabled(projectAlias, key.slice(prefix.length))) {
+          this.groupMessages.clear(key);
+        }
       }
     }
   }
@@ -2468,7 +2480,7 @@ async function handleSlashCommand(pm, alias, text) {
         '/status             — 查看所有项目状态',
         '/backup             — 立即触发一次备份',
         '/model [名称] [alias] — 查看或切换模型（如 glm-5.2 / qwen3.8-max）',
-        '/hard [alias]       — 切换到 gpt-6-astra + high（下次消息生效）',
+        '/hard [alias]       — 切换到 gpt-6.2-astra + high（下次消息生效）',
         '/cost [alias]       — 查看 token 用量',
         '/context [alias]    — 查看上下文窗口占用',
         '/compact [alias]    — 压缩会话历史',
@@ -2619,9 +2631,9 @@ async function handleSlashCommand(pm, alias, text) {
     if (proj.agent.info().status === 'busy') {
       return { text: `项目 ${target} 正在处理消息，请先等待完成或 /interrupt 打断后再切换模型。` };
     }
-    proj.agent._model = 'gpt-6-astra';
+    proj.agent._model = 'gpt-6.2-astra';
     proj.agent._reasoningEffort = 'high';
-    return { text: `✅ 项目 ${target} 已切换到 gpt-6-astra + high\n下次消息起生效。` };
+    return { text: `✅ 项目 ${target} 已切换到 gpt-6.2-astra + high\n下次消息起生效。` };
   }
 
   if (cmd === '/model') {
@@ -3675,7 +3687,7 @@ async function runSelfTest() {
   // Model and effort move together for /hard; /reset and /start restore defaults.
   const profileCalls = [];
   const profileAgent = new CodexAppServer({
-    workDir: '/tmp', model: 'gpt-6.1-sol', reasoningEffort: 'xhigh',
+    workDir: '/tmp', model: 'gpt-6.2-sol', reasoningEffort: 'xhigh',
   });
   profileAgent.start = async () => {};
   profileAgent._send = async (method, params) => {
@@ -3686,7 +3698,7 @@ async function runSelfTest() {
   };
   await profileAgent._ensureThread();
   ok('new thread uses default model and effort',
-    profileCalls[0].params.model === 'gpt-6.1-sol'
+    profileCalls[0].params.model === 'gpt-6.2-sol'
     && profileCalls[0].params.config.model_reasoning_effort === 'xhigh');
   const profilePm = new ProjectManager({});
   profilePm._saveSessions = () => {};
@@ -3696,19 +3708,19 @@ async function runSelfTest() {
   await new Promise((resolve) => setImmediate(resolve));
   const hardParams = profileCalls.find((call) => call.method === 'turn/start')?.params;
   ok('/hard applies Astra and high on next turn',
-    hardParams?.model === 'gpt-6-astra' && hardParams?.effort === 'high');
+    hardParams?.model === 'gpt-6.2-astra' && hardParams?.effort === 'high');
   profileAgent._finishTurn({ status: 'completed' });
   await hardTurn;
   await profilePm.resetProject('profile');
   await profileAgent._ensureThread();
   const resetParams = profileCalls.filter((call) => call.method === 'thread/start').at(-1)?.params;
   ok('/reset restores Sol and xhigh for a fresh thread',
-    resetParams?.model === 'gpt-6.1-sol' && resetParams?.config.model_reasoning_effort === 'xhigh');
+    resetParams?.model === 'gpt-6.2-sol' && resetParams?.config.model_reasoning_effort === 'xhigh');
   await handleSlashCommand(profilePm, 'profile', '/hard');
   await profilePm.stopProject('profile');
   await profilePm.startProject('profile');
   ok('/start restores default profile',
-    profileAgent.info().model === 'gpt-6.1-sol' && profileAgent.info().reasoningEffort === 'xhigh');
+    profileAgent.info().model === 'gpt-6.2-sol' && profileAgent.info().reasoningEffort === 'xhigh');
 
   // 6) pendingMessages single-slot queue
   pendingMessages.set('test', { text: 'a', chatId: 'c', channel: null, thresholdMs: 0 });
@@ -3935,7 +3947,7 @@ async function runSelfTest() {
   await groupHandler(message('/context'));
   await groupHandler(message('/help'));
   ok('group Slash commands use their existing handlers without @',
-    groupChat.project.agent.info().model === 'gpt-6-astra'
+    groupChat.project.agent.info().model === 'gpt-6.2-astra'
     && privateChat.project.agent.info().model === 'relay-model'
     && conversationPm.groupMessages.count(groupChat.alias) === 1);
   await groupHandler(message('/custom-task-without-mention'));
@@ -4119,7 +4131,7 @@ async function runSelfTest() {
   ok('other bots AI conclusions remain group background',
     conversationPm.groupMessages.count(sharedXiaobei.alias) === 1
     && conversationPm.groupMessages.messages.get(sharedXiaobei.alias)[0].content === 'AI 分析后的实质性结论');
-  await noticeHandlers[1](message(`${sharedRelay.alias} 会话已重置，下次对话将开始新会话（gpt-6.1-sol + xhigh）`, {
+  await noticeHandlers[1](message(`${sharedRelay.alias} 会话已重置，下次对话将开始新会话（gpt-6.2-sol + xhigh）`, {
     chatId: 'shared-room', raw: { sender: { sender_type: 'user' } },
   }));
   ok('user quotes of control replies are preserved', conversationPm.groupMessages.count(sharedXiaobei.alias) === 2);
@@ -4175,6 +4187,40 @@ async function runSelfTest() {
     privateOnlyPm.resolveTarget(groupChat.alias, 'codes') === disabledGroup
     && !privateOnlyPm.getProject(disabledGroup)
     && await resolveScheduledConversation(privateOnlyPm, 'codes', { chatId: 'group-1', chatType: 'group' }, {}) === null);
+
+  // Retired groups must stay removed even if the old process saves them on exit.
+  const retiredPm = new ProjectManager({ ...conversationConfig, disabledGroupChats: ['group-1'] });
+  retiredPm._saveSessions = () => {};
+  retiredPm._restoreProjects(snapshot);
+  ok('retired groups are excluded for every bot while private and other groups restore',
+    !retiredPm.getProject(groupChat.alias) && !retiredPm.getProject(xiaobeiGroup.alias)
+    && retiredPm.getProject('relay').agent.info().sessionId === 'relay-thread'
+    && retiredPm.getProject(otherGroup.alias).agent.info().sessionId === `${otherGroup.alias}-thread`);
+  for (const conversation of [groupChat, xiaobeiGroup, otherGroup]) {
+    retiredPm.groupMessages.append(conversation.alias, groupMessageRecord(message('遗留背景')));
+  }
+  retiredPm._clearDisabledGroupMessages();
+  ok('retired group buffers are removed across bots without clearing active groups',
+    retiredPm.groupMessages.count(groupChat.alias) === 0
+    && retiredPm.groupMessages.count(xiaobeiGroup.alias) === 0
+    && retiredPm.groupMessages.count(otherGroup.alias) === 1);
+  const sendsBeforeRetiredInput = privateOnlySends.length;
+  for (const projectAlias of ['relay', 'xiaobei-dev']) {
+    const retiredHandler = createNormalizedMessageHandler(retiredPm, projectAlias, privateOnlyChannel, 0);
+    for (const incoming of [message('背景'), message('@ 你', { mentionedBot: true }), message('/start')]) {
+      await retiredHandler(incoming);
+    }
+  }
+  ok('retired group input cannot recreate sessions, buffer messages, or send replies',
+    !retiredPm.getProject(groupChat.alias) && !retiredPm.getProject(xiaobeiGroup.alias)
+    && retiredPm.groupMessages.count(groupChat.alias) === 0
+    && retiredPm.groupMessages.count(xiaobeiGroup.alias) === 0
+    && privateOnlySends.length === sendsBeforeRetiredInput);
+  ok('schedules cannot recreate retired groups, including legacy jobs without chat type',
+    await resolveScheduledConversation(retiredPm, 'relay', { chatId: 'group-1', chatType: 'group' }, {}) === null
+    && await resolveScheduledConversation(retiredPm, 'xiaobei-dev', { chatId: 'group-1' }, {
+      async getChatMode() { return 'group'; },
+    }) === null);
 
   console.log('[OK] Selftests finished');
 }

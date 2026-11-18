@@ -11,7 +11,16 @@ done
 node -e 'if (Number(process.versions.node.split(".")[0]) < 22) process.exit(1)' || {
   echo 'Node.js 22+ is required.' >&2; exit 1;
 }
-codex --version
+EXPECTED_CODEX_VERSION='0.169.0'
+CODEX_VERSION_OUTPUT="$(codex --version)"
+echo "$CODEX_VERSION_OUTPUT"
+if [[ "$CODEX_VERSION_OUTPUT" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+  if [[ "${BASH_REMATCH[1]}" != "$EXPECTED_CODEX_VERSION" ]]; then
+    echo "Warning: tested Codex version is $EXPECTED_CODEX_VERSION; verify compatibility before using ${BASH_REMATCH[1]}." >&2
+  fi
+else
+  echo "Warning: could not parse Codex version; tested version is $EXPECTED_CODEX_VERSION." >&2
+fi
 CODEX_BIN="$(command -v codex)"
 export CODEX_BIN
 

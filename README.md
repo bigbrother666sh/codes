@@ -61,7 +61,7 @@
 
 - **Node.js** 22+
 - **@larksuiteoapi/node-sdk** 1.66.0（飞书 SDK，bridge 自带）
-- **Codex CLI** — `npm install -g @openai/codex`（协议基线版本：0.164.0）
+- **Codex CLI** — `npm install -g @openai/codex@0.169.0`（协议基线版本：0.169.0）
 - **本机 Codex 已配置并能正常使用**（登录或模型端点配置均由 Codex 管理）
 - **飞书自建应用** — 需要 App ID + App Secret（详见下方配置步骤）
 
@@ -110,7 +110,7 @@ chmod 600 ~/.codes/secrets/myapp_secret
 
 先在终端确认 `codex` 能正常工作。bridge 使用同一套 Codex 配置、登录、MCP 和记忆设置。
 
-在仓库根目录运行 `./deploy.sh` 可安装 bridge 依赖并启用用户服务；已有 `~/.codes/bridge.json` 会直接复用，不覆盖项目和凭据。脚本不安装或重新配置 Codex。
+在仓库根目录运行 `./deploy.sh` 可安装 bridge 依赖并启用用户服务；已有 `~/.codes/bridge.json` 会直接复用，不覆盖项目和凭据。脚本不安装或重新配置 Codex，会核对已验证的 0.169.0 版本并在不匹配时提示。
 
 ### 3. 启动
 
@@ -129,12 +129,13 @@ node bridge.mjs
 | `projects.*.feishu.appId` | 飞书 App ID | 必填 |
 | `projects.*.feishu.appSecretPath` | Secret 文件路径 | 必填 |
 | `projects.*.feishu.allowGroupChats` | 是否接入群聊；设为 `false` 时仅接入私聊，启动时移除该项目的群会话映射和未发送背景 | `true` |
+| `disabledGroupChats` | 停用的群 chat ID 数组，对所有 bot 生效；启动时清理其会话映射和未发送背景，并忽略后续群输入与定时恢复 | `[]` |
 | `codexPath` | 本机 codex CLI 路径，服务中建议使用绝对路径 | `"codex"` |
 | `thinkingThresholdMs` | 进度提示阈值（ms） | 2500 |
 | `debug` | 调试模式 | `false` |
 | `backup` | 可选手动备份配置（如 `{ "dest": "~/Backups" }`） | `false` |
 
-默认不传模型、推理强度、provider、沙箱、审批或上下文配置覆盖，全部由本机 Codex 决定。可通过 `codexDefaults.model` 和 `codexDefaults.reasoningEffort` 设置所有项目的新会话及 `/reset` 默认值，例如 `gpt-6.1-sol` 和 `xhigh`；`projects.*.codex` 可覆盖单个项目。provider 必须已在本机 Codex 中定义。旧的 `providers`、`mcpServers` 字段不再生成配置，需要在本机 Codex 中维护。
+默认不传模型、推理强度、provider、沙箱、审批或上下文配置覆盖，全部由本机 Codex 决定。可通过 `codexDefaults.model` 和 `codexDefaults.reasoningEffort` 设置所有项目的新会话及 `/reset` 默认值，例如 `gpt-6.2-sol` 和 `xhigh`；`projects.*.codex` 可覆盖单个项目。provider 必须已在本机 Codex 中定义。旧的 `providers`、`mcpServers` 字段不再生成配置，需要在本机 Codex 中维护。
 
 bridge 不再安排每日备份。仅显式配置 `backup.dest` 后，`/backup` 才能手动打包 `.codes`；它不包含默认 `~/.codex`。
 
@@ -252,7 +253,7 @@ bridge 不再安排每日备份。仅显式配置 `backup.dest` 后，`/backup` 
 | `/clear [alias]` | 同 `/reset`；群聊中两者都会清空尚未发送给 AI 的积累 |
 | `/interrupt [alias]` | 打断当前正在处理的消息 |
 | `/model [名称] [alias]` | 查看或切换模型（下一条消息生效） |
-| `/hard [alias]` | 切换到 `gpt-6-astra` + `high`（下一条消息生效） |
+| `/hard [alias]` | 切换到 `gpt-6.2-astra` + `high`（下一条消息生效） |
 | `/cost [alias]` | 查看 token 用量（累计/上一轮） |
 | `/context [alias]` | 查看上下文窗口占用 |
 | `/compact [alias]` | 压缩会话历史 |
@@ -296,7 +297,7 @@ curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
 sudo apt-get install -y nodejs
 
 # 2. 安装 Codex CLI
-npm install -g @openai/codex
+npm install -g @openai/codex@0.169.0
 
 # 3. 克隆并安装
 git clone https://github.com/bigbrother666sh/codes.git ~/codes
